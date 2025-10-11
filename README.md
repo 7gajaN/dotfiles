@@ -31,10 +31,11 @@ This repository contains my personal configuration files (dotfiles) for my Arch 
 - **PulseAudio/Pavucontrol**: Sound system and volume control config.
 - **Spicetify**: Spotify client theming (optional).
 
-# Fonts used in my dotfiles configuration
+## Fonts Used
 
-# Main fonts (from i3, kitty, polybar, rofi, nvim configs)
+The following fonts are referenced in my configuration files. For a fresh install, make sure to install all of these (including their Nerd Font or icon font variants as specified):
 
+```text
 Source Sans Pro, Semibold
 Hack Nerd Font Mono
 Hack Nerd Font Mono Bold
@@ -53,12 +54,10 @@ feather
 icomoon-feather
 Droid Sans
 JetBrains Mono Nerd Font
+```
 
-# Notes:
-# - "Nerd Font" refers to any patched font from https://www.nerdfonts.com (multiple variants used)
-# - Some configs use variants (Mono, Bold, Italic, etc.)
-# - "feather", "FontAwesome", "MaterialIcons", "Material-Design-Iconic-Font", "icomoon-feather" are icon fonts for Polybar/Rofi
-# - "Fantasque Sans Mono", "JetBrains Mono Nerd Font", "Iosevka Nerd Font" are popular patched coding fonts
-# - "Source Sans Pro", "Noto Sans", "Droid Sans" are UI fonts used in bars and menus
-
-# For a fresh install, ensure you install these fonts (and their Nerd Font versions if specified)
+- **Nerd Font** refers to any patched font from [nerdfonts.com](https://www.nerdfonts.com) (multiple variants used)
+- Some configs use variants (Mono, Bold, Italic, etc.)
+- **feather**, **FontAwesome**, **MaterialIcons**, **Material-Design-Iconic-Font**, **icomoon-feather** are icon fonts for Polybar/Rofi
+- **Fantasque Sans Mono**, **JetBrains Mono Nerd Font**, **Iosevka Nerd Font** are popular patched coding fonts
+- **Source Sans Pro**, **Noto Sans**, **Droid Sans** are UI fonts used in bars and menus
