@@ -6,8 +6,8 @@ export ZSH="$HOME/.oh-my-zsh"
 
 zle_highlight=('paste:none')
 
-alias vpn-enable='sudo systemctl enable --now openvpn-client@client'
-alias vpn-disable='sudo systemctl disable --now openvpn-client@client'
+alias vpn-start='sudo systemctl start openvpn-client@client'
+alias vpn-stop='sudo systemctl stop openvpn-client@client'
 
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk/
 export PATH=$JAVA_HOME/bin:$PATH
