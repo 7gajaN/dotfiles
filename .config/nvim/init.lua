@@ -173,19 +173,6 @@ vim.o.confirm = true
 --  See `:help hlsearch`
 vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
 
--- Override n key to have normal behavior in search
-vim.api.nvim_create_autocmd('VimEnter', {
-  callback = function()
-    -- try to delete any mapping for 'n' and 'N' (no error if none)
-    pcall(vim.keymap.del, 'n', 'n')
-    pcall(vim.keymap.del, 'n', 'N')
-
-    -- restore normal search-next behavior; replace RHS if you prefer plain 'n'/'N'
-    vim.keymap.set('n', 'n', 'nzzzv', { noremap = true, silent = true })
-    vim.keymap.set('n', 'N', 'Nzzzv', { noremap = true, silent = true })
-  end,
-})
-
 -- Diagnostic keymaps
 vim.keymap.set('n', '<leader>q', vim.diagnostic.setloclist, { desc = 'Open diagnostic [Q]uickfix list' })
 
@@ -967,9 +954,23 @@ require('lazy').setup({
       -- Load the colorscheme here.
       -- Like many other themes, this one has different styles, and you could load
       -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-      vim.cmd.colorscheme 'tokyonight-night'
+      -- vim.cmd.colorscheme 'tokyonight-night'
     end,
   },
+  {
+    'IllegalLeft/honeywell.vim',
+    priority = 1000,
+    config = function()
+      vim.cmd.colorscheme 'honeywell'
+    end,
+  },
+  { 'plumj-am/jimbo.vim' },
+  { 'srcery-colors/srcery-vim' },
+  'IllegalLeft/honeywell.vim',
+  priority = 1000,
+  config = function()
+    vim.cmd.colorscheme 'honeywell'
+  end,
 
   -- Highlight todo, notes, etc in comments
   { 'folke/todo-comments.nvim', event = 'VimEnter', dependencies = { 'nvim-lua/plenary.nvim' }, opts = { signs = false } },
