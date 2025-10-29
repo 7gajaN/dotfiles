@@ -173,6 +173,19 @@ vim.o.confirm = true
 --  See `:help hlsearch`
 vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
 
+-- Override n key to have normal behavior in search
+vim.api.nvim_create_autocmd('VimEnter', {
+  callback = function()
+    -- try to delete any mapping for 'n' and 'N' (no error if none)
+    pcall(vim.keymap.del, 'n', 'n')
+    pcall(vim.keymap.del, 'n', 'N')
+
+    -- restore normal search-next behavior; replace RHS if you prefer plain 'n'/'N'
+    vim.keymap.set('n', 'n', 'nzzzv', { noremap = true, silent = true })
+    vim.keymap.set('n', 'N', 'Nzzzv', { noremap = true, silent = true })
+  end,
+})
+
 -- Diagnostic keymaps
 vim.keymap.set('n', '<leader>q', vim.diagnostic.setloclist, { desc = 'Open diagnostic [Q]uickfix list' })
 
@@ -274,20 +287,57 @@ require('lazy').setup({
     'mfussenegger/nvim-jdtls',
     ft = { 'java' },
   },
+  -- },
   {
     'nvim-tree/nvim-tree.lua',
     event = 'VimEnter',
     dependencies = { 'nvim-tree/nvim-web-devicons' },
-    keys = {
-      { 'n', '<leader>e', ':NvimTreeToggle<CR>', { silent = true } },
-    },
     config = function()
       require('nvim-tree').setup {
         -- you can set options here!
         view = { width = 30 },
         filters = { dotfiles = false },
       }
-      vim.keymap.set('n', '<leader>e', ':NvimTreeToggle<CR>', { silent = true, desc = 'Toggle NvimTree' })
+      vim.keymap.set('n', '<leader>ee', ':NvimTreeToggle<CR>', { silent = true, desc = 'Toggle NvimTree' })
+      vim.keymap.set('n', '<leader>e', ':NvimTreeFocus<CR>', { silent = true, desc = 'Focus NvimTree' })
+    end,
+  },
+  {
+    'Vigemus/iron.nvim',
+    config = function()
+      require 'plugins.iron'
+    end,
+  },
+  -- Lua
+  {
+    'folke/persistence.nvim',
+    event = 'VimEnter',
+    opts = {
+      -- add any custom options here
+    },
+    config = function()
+      require('persistence').setup {
+        dir = vim.fn.stdpath 'state' .. '/sessions/', -- directory where session files are saved
+        -- minimum number of file buffers that need to be open to save
+        -- Set to 0 to always save
+        need = 1,
+        branch = true, -- use git branch to save session
+      }
+      vim.keymap.set('n', '<leader>ps', function()
+        require('persistence').load()
+      end, { silent = true, desc = 'Load the session for the current directory' })
+
+      vim.keymap.set('n', '<leader>pS', function()
+        require('persistence').select()
+      end, { silent = true, desc = 'Select a session to load' })
+
+      vim.keymap.set('n', '<leader>pl', function()
+        require('persistence').load { last = true }
+      end, { silent = true, desc = 'Load the last session' })
+
+      vim.keymap.set('n', '<leader>pd', function()
+        require('persistence').stop()
+      end, { silent = true, desc = 'Stop Persistence' })
     end,
   },
   -- ...other plugins...
@@ -367,6 +417,8 @@ require('lazy').setup({
         { '<leader>s', group = '[S]earch' },
         { '<leader>t', group = '[T]oggle' },
         { '<leader>h', group = 'Git [H]unk', mode = { 'n', 'v' } },
+        { '<leader>p', group = '[P]ersistence' },
+        { '<leader>r', group = '[R]epl' },
       },
     },
   },
@@ -693,7 +745,7 @@ require('lazy').setup({
       local servers = {
         -- clangd = {},
         -- gopls = {},
-        -- pyright = {},
+        pyright = {},
         -- rust_analyzer = {},
         -- ... etc. See `:help lspconfig-all` for a list of all the pre-configured LSPs
         --
@@ -736,6 +788,7 @@ require('lazy').setup({
       local ensure_installed = vim.tbl_keys(servers or {})
       vim.list_extend(ensure_installed, {
         'stylua', -- Used to format Lua code
+        'black', -- Used to format python code
       })
       require('mason-tool-installer').setup { ensure_installed = ensure_installed }
 
@@ -964,7 +1017,7 @@ require('lazy').setup({
     main = 'nvim-treesitter.configs', -- Sets main module to use for opts
     -- [[ Configure Treesitter ]] See `:help nvim-treesitter`
     opts = {
-      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc' },
+      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc', 'json', 'jsonc', 'css' },
       -- Autoinstall languages that are not installed
       auto_install = true,
       highlight = {
