@@ -1,0 +1,67 @@
+// -*- mode: jsonc -*-
+{
+	// "layer": "top", // Waybar at top layer
+	// "position": "bottom", // Waybar position (top|bottom|left|right)
+	"height": 34, // Waybar height (to be removed for auto height)
+	// "width": 1280, // Waybar width
+	"spacing": 4, // Gaps between modules (4px)
+	// Choose the order of the modules
+	"modules-left": [
+		"custom/menu",
+		"hyprland/workspaces",
+	],
+	"modules-center": [
+	],
+	"modules-right": [
+		"custom/vpn",
+		"pulseaudio",
+		"clock",
+	],
+
+	//MODULES
+	"hyprland/workspaces": {
+		"format": "{icon}",
+		"format-icons": {
+			"1": "Ⅰ",
+			"2": "Ⅱ",
+			"3": "Ⅲ",
+			"4": "Ⅳ",
+			"5": "Ⅴ",
+			"6": "Ⅵ",
+			"7": "Ⅶ",
+			"8": "Ⅷ",
+			"9": "Ⅸ",
+			"10": "Ⅹ",
+			"default": "●"
+		}
+	},
+	"clock": {
+		// "timezone": "America/New_York",
+		"tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>",
+		"format-alt": "{:%Y-%m-%d}"
+	},
+	"pulseaudio": {
+		"format": " {volume}%",
+		"format-muted": " 0%",
+		"on-click": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+		"tooltip": false
+	},
+	"custom/menu": {
+		"format" : "",
+		"tooltip": false,
+		"on-click": "rofi -show drun",
+		"menu": "on-click-right",
+		"menu-file": "$HOME/.config/waybar/custom_modules/power_menu.xml", // Menu file in resources folder
+		"menu-actions": {
+			"shutdown": "shutdown",
+			"reboot": "reboot",
+			"suspend": "systemctl suspend",
+			"hibernate": "systemctl hibernate"
+		}
+	},
+	"custom/vpn": {
+		"exec": "~/.config/waybar/scripts/vpn_toggle.sh",
+		"interval": 5,
+		"return-type": "json"
+	},
+}

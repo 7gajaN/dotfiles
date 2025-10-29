@@ -1,0 +1,62 @@
+* {
+	border: none;
+	border-radius: 0;
+	font-size: 16px;
+	min-height: 0;
+	font-weight: bold;
+}
+
+window#waybar {
+	background-color: black;
+	color: white;
+}
+
+#custom-menu{
+	color: #B22222;
+	padding: 0 10px;
+	margin-left: 20px;
+}
+
+#workspaces {
+	padding:0 10px;
+	margin-left: 15px;
+}
+
+#workspaces button {
+	font-family: "Times New Roman";
+	font-weight: bold;
+	padding: 0 8px;
+}
+
+#workspaces button.active {
+	color: #B22222;
+	font-weight: bold;
+}
+
+#workspaces button:hover {
+	border-bottom: 2px solid #B22222; 
+	background: transparent;
+}
+
+#pulseaudio{
+	font-family: "Ubuntu Nerd Font";
+	padding: 0 3px;
+	margin: 0 10px;
+}
+
+#custom-vpn{
+	font-family: "Ubuntu Nerd Font";
+	padding: 0 3px;
+	margin: 0 5px;
+}
+
+#custom-vpn.vpn-on{
+	color: #B22222;
+}
+
+
+#clock{
+	font-family: "Ubuntu Nerd Font";
+	padding: 0 3px;
+	margin-right: 27px;
+}
