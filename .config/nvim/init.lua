@@ -285,8 +285,7 @@ require('lazy').setup({
         view = { width = 30 },
         filters = { dotfiles = false },
       }
-      vim.keymap.set('n', '<leader>ee', ':NvimTreeToggle<CR>', { silent = true, desc = 'Toggle NvimTree' })
-      vim.keymap.set('n', '<leader>e', ':NvimTreeFocus<CR>', { silent = true, desc = 'Focus NvimTree' })
+      vim.keymap.set('n', '<leader>e', ':NvimTreeToggle<CR>', { silent = true, desc = 'Toggle NvimTree' })
     end,
   },
   {
@@ -730,9 +729,9 @@ require('lazy').setup({
       --  - settings (table): Override the default settings passed when initializing the server.
       --        For example, to see the options for `lua_ls`, you could go to: https://luals.github.io/wiki/settings/
       local servers = {
-        -- clangd = {},
+        clangd = {},
         -- gopls = {},
-        pyright = {},
+        -- pyright = {},
         -- rust_analyzer = {},
         -- ... etc. See `:help lspconfig-all` for a list of all the pre-configured LSPs
         --
@@ -776,6 +775,7 @@ require('lazy').setup({
       vim.list_extend(ensure_installed, {
         'stylua', -- Used to format Lua code
         'black', -- Used to format python code
+        'clang-format', -- used to format c/c++ code
       })
       require('mason-tool-installer').setup { ensure_installed = ensure_installed }
 
