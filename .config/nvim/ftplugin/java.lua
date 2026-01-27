@@ -1,5 +1,14 @@
 local jdtls = require 'jdtls'
 
+local root_markers = { '.git', 'mvnw', 'gradlew', 'pom.xml', 'build.gradle' }
+local root_dir = require('jdtls.setup').find_root(root_markers)
+if not root_dir then
+  return
+end
+
+local project_name = vim.fn.fnamemodify(root_dir, ':p:h:t')
+local workspace_dir = vim.fn.stdpath 'data' .. '/jdtls-workspace/' .. project_name
+
 local config = {
   name = 'jdtls',
 
@@ -9,11 +18,16 @@ local config = {
   -- As alternative you could also avoid the `jdtls` wrapper and launch
   -- eclipse.jdt.ls via the `java` executable
   -- See: https://github.com/eclipse/eclipse.jdt.ls#running-from-the-command-line
-  cmd = { 'jdtls' },
+  cmd = {
+    'jdtls',
+    '--jvm-arg=-javaagent:' .. vim.fn.expand('~/.local/share/nvim/mason/packages/jdtls/lombok.jar'),
+    '-data',
+    workspace_dir,
+  },
 
   -- `root_dir` must point to the root of your project.
   -- See `:help vim.fs.root`
-  root_dir = vim.fs.root(0, { '.git', 'mvnw', 'gradlew', 'pom.xml', 'build.gradle' }),
+  root_dir = root_dir,
 
   -- Here you can configure eclipse.jdt.ls specific settings
   -- See https://github.com/eclipse/eclipse.jdt.ls/wiki/Running-the-JAVA-LS-server-from-the-command-line#initialize-request
@@ -25,6 +39,12 @@ local config = {
       },
       saveActions = {
         organizeImports = false,
+      },
+      project = {
+        resourceFilters = { 'node_modules', '.git' },
+      },
+      configuration = {
+        runtimes = {},
       },
     },
   },
@@ -40,11 +60,5 @@ local config = {
     bundles = {},
   },
 }
-
-local root_markers = { '.git', 'mvnw', 'gradlew', 'pom.xml', 'build.gradle' }
-local root_dir = require('jdtls.setup').find_root(root_markers)
-if not root_dir then
-  return
-end
 
 require('jdtls').start_or_attach(config)
