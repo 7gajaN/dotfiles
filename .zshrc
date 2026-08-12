@@ -113,3 +113,4 @@ source $ZSH/oh-my-zsh.sh
 
 export PATH=$PATH:/home/gion/.spicetify
 fastfetch
+export PATH="$HOME/.local/bin:$PATH"
