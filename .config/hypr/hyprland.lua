@@ -249,6 +249,11 @@ for i = 1, 10 do
     hl.bind(mod .. " + SHIFT + " .. key,     hl.dsp.window.move({ workspace = i }))
 end
 
+-- Workspace 11 (portrait monitor) is outside the 1-10 range and has no number
+-- key of its own. ALT+SHIFT+1 was not an option: the loop above already uses
+-- ALT+SHIFT+<n> to move a window to workspace n.
+hl.bind(mod .. " + CTRL + 1", hl.dsp.focus({ workspace = 11 }))
+
 -- Screenshots
 hl.bind("Print",                   hl.dsp.exec_cmd([[grim ~/Pictures/$(date +%Y%m%d_%H%M%S).png]]))
 hl.bind("SHIFT + Print",           hl.dsp.exec_cmd([[grim -g "$(slurp)" ~/Pictures/$(date +%Y%m%d_%H%M%S).png]]))
