@@ -1,33 +1,51 @@
 # Dotfiles for Arch Linux Environment
 
-This repository contains my personal configuration files (dotfiles) for my Arch Linux setup. 
+My personal configuration files for an Arch Linux + Hyprland (Wayland) setup.
+
+## Layout
+
+Two kinds of config live here, installed two different ways.
+
+| Path | Installs to | How |
+|---|---|---|
+| `.config/*` | `~/.config/` | symlinked |
+| `.bashrc`, `.zshrc` | `~/` | symlinked |
+| `system/*` | `/etc`, `/usr/share` | copied by a script (root-owned) |
+
+Everything under `.config/` is symlinked into `~/.config`, so edits in either
+place are the same file. `system/` holds root-owned system files that cannot be
+symlinked out of a user's home — see [`system/sddm/README.md`](system/sddm/README.md).
 
 ## Apps and Tools Configured
 
 ### Window Management & Desktop
-- **i3**: Tiling window manager for fast and flexible workspace management.
-- **picom**: Lightweight compositor for X11, providing transparency and shadow effects.
-- **polybar**: Highly customizable status bar for window managers.
-- **feh**: Lightweight image viewer, used for setting wallpapers.
+- **Hyprland**: Wayland compositor and tiling WM. Configured in Lua
+  (`.config/hypr/hyprland.lua`), not the usual `hyprland.conf`.
+- **hy3**: Hyprland plugin providing i3-style tiling. Loaded at startup and
+  version-locked to Hyprland, so both must be upgraded together.
+- **Waybar**: status bar (`.config/waybar/`).
+- **awww**: Wayland wallpaper daemon. Set per-output at startup — without `-o`
+  the last call wins on every monitor.
+- **grim** + **slurp**: screenshots, bound to `Print`.
 
 ### Terminal & Shell
-- **Kitty**: GPU-based, fast, and feature-rich terminal emulator.
-- **Ranger**: Vim-like file manager for the terminal.
-- **Zsh**: Powerful shell with plugins and themes (see `.zshrc`).
+- **Kitty**: GPU-based terminal emulator.
+- **Ranger**: Vim-like terminal file manager.
+- **Zsh**: primary shell (see `.zshrc`).
+- **Bash**: fallback shell (see `.bashrc`).
 
 ### Text Editing
-- **Neovim**: Hyperextensible Vim-based text editor, configured for coding and writing.
+- **Neovim**: configured for coding and writing; plugins via lazy.nvim.
 
 ### Application Launching & Menu
-- **Rofi**: Window switcher, run dialog, and application launcher.
+- **Rofi**: window switcher, run dialog, and application launcher.
 
 ### System Info & Appearance
-- **Fastfetch**: Fast system information tool for displaying system stats on startup.
+- **Fastfetch**: system information tool, run on shell startup.
 
 ### Login Screen
-- **SDDM**: minimal black greeter, main monitor only. Unlike everything else
-  here these files are root-owned system files, so they live under
-  `system/sddm/` and are installed by a script rather than symlinked:
+- **SDDM**: minimal black greeter, main monitor only. Root-owned, so it lives
+  under `system/sddm/` and is installed by script rather than symlinked:
 
   ```sh
   sudo sh system/sddm/install.sh
@@ -36,40 +54,23 @@ This repository contains my personal configuration files (dotfiles) for my Arch 
   See [`system/sddm/README.md`](system/sddm/README.md) — it documents the Qt5
   greeter trap that makes a broken theme fail silently.
 
-### Other Configured Apps (not included in the dot files)
-- **Thunar**: Lightweight file manager (configuration included if personalized).
-- **OpenRGB**: RGB lighting control for hardware components (optional).
-- **GTK 3.0**: GTK theme and appearance settings (if customized).
-- **PulseAudio/Pavucontrol**: Sound system and volume control config.
-- **Spicetify**: Spotify client theming (optional).
+### Installed, but no config in this repo
+- **mako**: Wayland notification daemon, running on defaults.
+- **OpenRGB**: RGB lighting control for hardware.
+- **PulseAudio/Pavucontrol**: sound system and volume control.
+- **GTK 3.0**: theme and appearance settings.
 
 ## Fonts Used
 
-The following fonts are referenced in my configuration files. For a fresh install, make sure to install all of these (including their Nerd Font or icon font variants as specified):
+Only four fonts are actually referenced by the configs in this repo. Install
+these (Nerd Font variants where noted) and nothing will fall back:
 
-```text
-Source Sans Pro, Semibold
-Hack Nerd Font Mono
-Hack Nerd Font Mono Bold
-Hack Nerd Font Mono Bold Italic
-Hack Nerd Font Mono Italic
-Nerd Font
-Fira Code
-Noto Sans
-NotoSans-Regular
-MaterialIcons
-FontAwesome
-Material-Design-Iconic-Font
-Fantasque Sans Mono
-Iosevka Nerd Font
-feather
-icomoon-feather
-Droid Sans
-JetBrains Mono Nerd Font
-```
+| Font | Used by |
+|---|---|
+| Hack Nerd Font Mono — Regular, Bold, Italic, Bold Italic | kitty |
+| Ubuntu Nerd Font | waybar |
+| JetBrains Mono Nerd Font | rofi |
+| Times New Roman | waybar (one rule) |
 
-- **Nerd Font** refers to any patched font from [nerdfonts.com](https://www.nerdfonts.com) (multiple variants used)
-- Some configs use variants (Mono, Bold, Italic, etc.)
-- **feather**, **FontAwesome**, **MaterialIcons**, **Material-Design-Iconic-Font**, **icomoon-feather** are icon fonts for Polybar/Rofi
-- **Fantasque Sans Mono**, **JetBrains Mono Nerd Font**, **Iosevka Nerd Font** are popular patched coding fonts
-- **Source Sans Pro**, **Noto Sans**, **Droid Sans** are UI fonts used in bars and menus
+Nerd Fonts are patched fonts from [nerdfonts.com](https://www.nerdfonts.com);
+the patched variant is required for the glyphs in waybar and rofi to render.
