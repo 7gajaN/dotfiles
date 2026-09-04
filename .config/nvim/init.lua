@@ -966,11 +966,6 @@ require('lazy').setup({
   },
   { 'plumj-am/jimbo.vim' },
   { 'srcery-colors/srcery-vim' },
-  'IllegalLeft/honeywell.vim',
-  priority = 1000,
-  config = function()
-    vim.cmd.colorscheme 'honeywell'
-  end,
 
   -- Highlight todo, notes, etc in comments
   { 'folke/todo-comments.nvim', event = 'VimEnter', dependencies = { 'nvim-lua/plenary.nvim' }, opts = { signs = false } },
