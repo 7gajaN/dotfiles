@@ -24,6 +24,18 @@ This repository contains my personal configuration files (dotfiles) for my Arch 
 ### System Info & Appearance
 - **Fastfetch**: Fast system information tool for displaying system stats on startup.
 
+### Login Screen
+- **SDDM**: minimal black greeter, main monitor only. Unlike everything else
+  here these files are root-owned system files, so they live under
+  `system/sddm/` and are installed by a script rather than symlinked:
+
+  ```sh
+  sudo sh system/sddm/install.sh
+  ```
+
+  See [`system/sddm/README.md`](system/sddm/README.md) — it documents the Qt5
+  greeter trap that makes a broken theme fail silently.
+
 ### Other Configured Apps (not included in the dot files)
 - **Thunar**: Lightweight file manager (configuration included if personalized).
 - **OpenRGB**: RGB lighting control for hardware components (optional).

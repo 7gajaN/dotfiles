@@ -1,0 +1,13 @@
+[SddmGreeterTheme]
+Name=Black
+Description=Minimal black greeter: one password field, nothing else.
+Author=gion
+Type=sddm-theme
+Version=1.0
+Website=
+Screenshot=
+MainScript=Main.qml
+ConfigFile=theme.conf
+TranslationsDirectory=
+Theme-Id=black
+Theme-API=2.0

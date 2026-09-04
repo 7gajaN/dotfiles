@@ -1,0 +1,63 @@
+#!/bin/sh
+# /etc/sddm/Xsetup - run as root before the login dialog appears.
+#
+# Lights only the main monitor for the greeter. Nothing here needs undoing:
+# this X server is torn down at login, and Hyprland then applies its own
+# hl.monitor() layout, which brings the second monitor back.
+#
+# The monitor is matched on its EDID serial rather than an output name. The
+# NVIDIA X driver numbers DisplayPort outputs on its own scheme, which does not
+# line up with the DRM connector names Hyprland uses (DP-2 / DP-3), so a
+# hardcoded name would be a guess.
+#
+# Fail-safe: if nothing matches, every output is left exactly as found. A dead
+# greeter is far worse than an extra monitor being on.
+
+set -u
+
+# Samsung Odyssey G40B. `hyprctl monitors` prints this in the description field.
+MAIN_EDID_MATCH="HNMW200279"
+
+command -v xrandr >/dev/null 2>&1 || exit 0
+
+main=$(xrandr --props 2>/dev/null | awk -v pat="$MAIN_EDID_MATCH" '
+    function flush(   i, s, c) {
+        if (!connected || hex == "") return
+        s = ""
+        for (i = 1; i < length(hex); i += 2) {
+            c = strtonum("0x" substr(hex, i, 2))
+            s = s ((c >= 32 && c < 127) ? sprintf("%c", c) : " ")
+        }
+        if (index(s, pat) > 0) { print out; found = 1; exit }
+    }
+
+    # Output headers are the only lines starting at column 0.
+    /^[^ \t]/ {
+        flush()
+        out = $1
+        connected = ($2 == "connected")
+        hex = ""
+        in_edid = 0
+        next
+    }
+
+    /^[ \t]+EDID:/ { in_edid = 1; hex = ""; next }
+
+    in_edid && /^[ \t]+[0-9a-fA-F]+[ \t]*$/ { gsub(/[ \t]/, "", $0); hex = hex $0; next }
+
+    in_edid { in_edid = 0 }
+
+    END { if (!found) flush() }
+')
+
+[ -n "$main" ] || exit 0
+
+# Enable the keeper first so there is never an instant with no active CRTC.
+xrandr --output "$main" --primary --auto 2>/dev/null
+
+xrandr --query 2>/dev/null | awk '/ connected/ { print $1 }' | while read -r out; do
+    [ "$out" = "$main" ] && continue
+    xrandr --output "$out" --off 2>/dev/null
+done
+
+exit 0
