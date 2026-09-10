@@ -662,20 +662,21 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(writes), 1)
 
     def test_two_bursts_separated_by_more_than_debounce_produce_two_snapshots(self):
-        """Two event bursts > debounce interval apart produce two snapshots."""
+        """Two event bursts > debounce interval apart produce two snapshots, with coalescing within each burst."""
         writes = []
         events = ScriptedEvents([
-            [("movewindow", "0xa,2")],  # Burst 1 at t=0
-            [],                          # Nothing
+            [("movewindow", "0xa,2"), ("movewindow", "0xa,3"), ("movewindow", "0xa,4")],  # Burst 1: 3 events
             [],                          # Nothing (time passes)
-            [("movewindow", "0xb,3")],  # Burst 2 at t=2.0 (2.0 > 1.0, past debounce)
+            [],                          # Nothing
+            [("movewindow", "0xb,5"), ("movewindow", "0xb,6")],  # Burst 2: 2 events at t=2.0
             [],                          # Nothing
             [],                          # Nothing
         ])
-        # Iter1: burst1(0), check(0), Iter2: nothing, check(0.5), Iter3: nothing,
-        # check(1.5→snap1!), Iter4: burst2(2.0), check(2.0), Iter5: nothing, check(2.5),
+        # Iter1: burst1(0,0,0) all update pending_since to 0, check(0)
+        # Iter2: nothing, check(0.5), Iter3: nothing, check(1.5→snap1!)
+        # Iter4: burst2(2.0,2.0) update to 2.0, check(2.0), Iter5: nothing, check(2.5)
         # Iter6: nothing, check(3.0→snap2!)
-        ticks = iter([0.0, 0.0, 0.5, 1.5, 2.0, 2.0, 2.5, 3.0])
+        ticks = iter([0.0, 0.0, 0.0, 0.0, 0.5, 1.5, 2.0, 2.0, 2.0, 2.5, 3.0])
         calls = {"n": 0}
 
         def stop():
@@ -684,7 +685,8 @@ class WatchTest(unittest.TestCase):
 
         session.watch(FakeHypr(), events, lambda: writes.append(1),
                       debounce=1.0, clock=lambda: next(ticks), stop=stop)
-        # First burst fires at t=1.5 (1.0s after event at 0), second at t=3.0 (1.0s after event at 2.0)
+        # First burst (3 events) coalesces to one snapshot at t=1.5
+        # Second burst (2 events) coalesces to one snapshot at t=3.0
         self.assertEqual(len(writes), 2)
 
     def test_snapshot_does_not_fire_before_debounce_elapses(self):
@@ -708,6 +710,23 @@ class WatchTest(unittest.TestCase):
                       debounce=1.0, clock=lambda: next(ticks), stop=stop)
         # No snapshot should fire because debounce never elapses
         self.assertEqual(writes, [])
+
+    def test_snapshot_failure_does_not_end_the_loop(self):
+        """A transient hyprctl or disk failure must not kill the watcher."""
+        def boom():
+            raise RuntimeError("hyprctl exploded")
+
+        events = ScriptedEvents([[("openwindow", "0xa,1,kitty,t")]])
+        ticks = iter([0.0, 0.0, 2.0, 2.0, 2.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        # Must return normally rather than propagate the exception.
+        session.watch(FakeHypr(), events, boom, debounce=1.0,
+                      clock=lambda: next(ticks), stop=stop)
 
 
 if __name__ == "__main__":
