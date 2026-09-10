@@ -277,6 +277,59 @@ class ProgramDetectionTest(unittest.TestCase):
         client = {"class": "kitty", "pid": 40}
         self.assertEqual(session.resolve_program(client, self.proc), "claude")
 
+    # -- Post-restore tree shape --------------------------------------
+    #
+    # `kitty ... -e claude --continue` makes claude kitty's DIRECT child:
+    # there is no intermediate shell to walk through the way a freshly
+    # opened terminal has one. Confirmed empirically against a throwaway
+    # `kitty --directory <dir> -e zsh -c "sleep 30"`: the sleep process was
+    # a direct child of kitty, cwd correct on that process, and both
+    # child_shell_cwd and child_program returned None against it before
+    # this fallback existed. Without handling this shape, a restored
+    # terminal loses its cwd AND its program on the very next capture, even
+    # though the allowlisted program is still running.
+
+    def test_direct_allowlisted_child_is_recorded_when_no_shell_exists(self):
+        program_cwd = self.proc / "restored-project"
+        program_cwd.mkdir()
+        fake_proc(self.proc, 50, ["kitty"], "kitty", "/home/u",
+                  children=[51, 52, 53])
+        fake_proc(self.proc, 51, ["kitten"], "kitten", "/home/u")
+        fake_proc(self.proc, 52, ["claude", "--continue"], "claude", "/home/u")
+        fake_proc(self.proc, 53, ["kitten"], "kitten", "/home/u")
+        (self.proc / "52" / "cwd").unlink()
+        (self.proc / "52" / "cwd").symlink_to(program_cwd)
+        self.assertEqual(session.child_program(50, self.proc), "claude")
+        self.assertEqual(session.child_shell_cwd(50, self.proc), str(program_cwd))
+
+    def test_fresh_shape_still_resolves_via_the_shell_unchanged(self):
+        # Same assertions as the post-restore test above, but against a
+        # freshly opened terminal's tree shape (shell present). This must
+        # keep behaving exactly as it does today: the shell is found and
+        # used, the fallback path is never reached.
+        shell_cwd = self.proc / "fresh-project"
+        shell_cwd.mkdir()
+        fake_proc(self.proc, 54, ["kitty"], "kitty", "/home/u", children=[55])
+        fake_proc(self.proc, 55, ["-zsh"], "zsh", "/home/u", children=[56])
+        fake_proc(self.proc, 56, ["claude", "--continue"], "claude", "/home/u")
+        (self.proc / "55" / "cwd").unlink()
+        (self.proc / "55" / "cwd").symlink_to(shell_cwd)
+        self.assertEqual(session.child_program(54, self.proc), "claude")
+        self.assertEqual(session.child_shell_cwd(54, self.proc), str(shell_cwd))
+
+    def test_direct_non_allowlisted_child_is_ignored_by_both_walks(self):
+        # The important negative case: the fallback must not turn any
+        # random direct child into a program or a cwd source -- ALLOWLIST
+        # membership stays the only gate.
+        other_cwd = self.proc / "unrelated"
+        other_cwd.mkdir()
+        fake_proc(self.proc, 60, ["kitty"], "kitty", "/home/u", children=[61])
+        fake_proc(self.proc, 61, ["htop"], "htop", "/home/u")
+        (self.proc / "61" / "cwd").unlink()
+        (self.proc / "61" / "cwd").symlink_to(other_cwd)
+        self.assertIsNone(session.child_program(60, self.proc))
+        self.assertIsNone(session.child_shell_cwd(60, self.proc))
+
 
 class FilteringTest(unittest.TestCase):
     def setUp(self):
@@ -469,6 +522,26 @@ class BuildSnapshotTest(unittest.TestCase):
         fake_proc(self.proc, 2, ["-zsh"], "zsh", "/home/u")
         snap = session.build_snapshot([self.client("kitty", 1, 1)], [], self.proc, "T")
         self.assertNotIn("program", snap["windows"][0])
+
+    def test_round_trip_for_post_restore_shape_keeps_cwd_and_program(self):
+        # A window restored via `-e claude --continue` has claude as kitty's
+        # direct child, with no intermediate shell. The NEXT capture must
+        # still carry both --directory and program, so a second reboot
+        # behaves like the first instead of degrading to a bare ["kitty"].
+        program_cwd = self.proc / "still-going"
+        program_cwd.mkdir()
+        fake_proc(
+            self.proc, 70,
+            ["kitty", "--directory", "/home/u", "-e", "claude", "--continue"],
+            "kitty", "/home/u", children=[71],
+        )
+        fake_proc(self.proc, 71, ["claude", "--continue"], "claude", "/home/u")
+        (self.proc / "71" / "cwd").unlink()
+        (self.proc / "71" / "cwd").symlink_to(program_cwd)
+        snap = session.build_snapshot([self.client("kitty", 70, 1)], [], self.proc, "T")
+        w = snap["windows"][0]
+        self.assertEqual(w["cmd"], ["kitty", "--directory", str(program_cwd)])
+        self.assertEqual(w["program"], "claude")
 
 
 class EventParsingTest(unittest.TestCase):

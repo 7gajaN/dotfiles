@@ -214,9 +214,23 @@ def child_shell_cwd(pid: int, proc: pathlib.Path) -> str | None:
     has navigated to. The interesting directory belongs to the shell running
     inside it. kitty also spawns 'kitten' helper children, which are skipped
     because their comm is not in SHELLS.
+
+    A terminal restored via `-e <program>` has no shell at all: the program
+    is kitty's direct child. When no SHELLS child is found, fall back to a
+    direct child whose comm is a key in ALLOWLIST and use its cwd instead --
+    but only that; a non-allowlisted direct child is never used as a cwd
+    source. The shell is always preferred when one exists, so a freshly
+    opened terminal behaves exactly as it always has.
     """
-    for child in _children(pid, proc):
+    children = _children(pid, proc)
+    for child in children:
         if _comm(child, proc) in SHELLS:
+            try:
+                return os.readlink(proc / str(child) / "cwd")
+            except OSError:
+                return None
+    for child in children:
+        if _comm(child, proc) in ALLOWLIST:
             try:
                 return os.readlink(proc / str(child) / "cwd")
             except OSError:
@@ -225,20 +239,29 @@ def child_shell_cwd(pid: int, proc: pathlib.Path) -> str | None:
 
 
 def child_program(pid: int, proc: pathlib.Path) -> str | None:
-    """Return the allowlisted program running in the terminal's shell, or None.
+    """Return the allowlisted program running in the terminal, or None.
 
-    One level deeper than child_shell_cwd: terminal -> child shell ->
-    grandchildren. Only a grandchild whose comm is a key in ALLOWLIST is ever
-    reported -- a name is read here only to check it against that table, and
-    the rest of the grandchild's cmdline is never looked at, so nothing
-    observed can travel any further than this one word.
+    Normally one level deeper than child_shell_cwd: terminal -> child shell
+    -> grandchildren. Only a grandchild whose comm is a key in ALLOWLIST is
+    ever reported -- a name is read here only to check it against that
+    table, and the rest of the grandchild's cmdline is never looked at, so
+    nothing observed can travel any further than this one word.
+
+    A terminal restored via `-e <program>` has no shell: the program is
+    kitty's direct child instead of its grandchild. A direct child is
+    therefore also checked against ALLOWLIST, on the same terms as a
+    grandchild -- membership is still the only gate, so this widens where a
+    match can be found, never what counts as one.
     """
     for child in _children(pid, proc):
-        if _comm(child, proc) in SHELLS:
+        comm = _comm(child, proc)
+        if comm in SHELLS:
             for grandchild in _children(child, proc):
                 name = _comm(grandchild, proc)
                 if name in ALLOWLIST:
                     return name
+        elif comm in ALLOWLIST:
+            return comm
     return None
 
 

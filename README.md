@@ -102,8 +102,9 @@ and tabs" setting instead.
 
 Whatever else happened to be running inside a terminal is not restored — with
 one narrow exception. `session.py` looks one level past the terminal's child
-shell: if a grandchild process's name is a key in the `ALLOWLIST` table, that
-name is saved as the window's `program` field, e.g.:
+shell (or, failing that, at the terminal's direct children — see below): if
+a process's name there is a key in the `ALLOWLIST` table, that name is saved
+as the window's `program` field, e.g.:
 
 ```json
 {"class": "kitty", "cmd": ["kitty", "--directory", "/home/gion/coding/MS"], "program": "claude"}
@@ -120,7 +121,21 @@ This is deliberately not "replay the recorded command line": the arguments a
 program was actually invoked with are read only to identify which program is
 running, then discarded. `ALLOWLIST` holds fixed templates, never recorded
 arguments — that table is the entire security boundary, since it is what
-runs unattended at every login. To allow another program, add it there:
+runs unattended at every login.
+
+Detection understands two tree shapes so this survives repeated reboots, not
+just one: a freshly opened terminal has an intermediate shell (terminal ->
+shell -> program), while a terminal that was itself restored via `-e
+<program>` has the program as the terminal's direct child instead (`-e`
+means there is no shell in between). `child_program`/`child_shell_cwd` check
+for the shell shape first and only fall back to a direct child when no shell
+exists, so a window keeps carrying both `--directory` and `program` on every
+capture after every restore — it does not degrade to a bare `["kitty"]`
+after the first round trip. The fallback is still gated on `ALLOWLIST`
+membership alone: a direct child that is not an allowlisted program is never
+used as a program or a cwd source.
+
+To allow another program, add it to the table:
 
 ```python
 ALLOWLIST = {"claude": ["claude", "--continue"]}
