@@ -981,6 +981,9 @@ class CaptureTest(unittest.TestCase):
             "monitor": 0, "at": [0, 0], "size": [100, 100], "fullscreen": 0,
         }
 
+    def _log(self):
+        return (session.state_dir() / "session.log").read_text()
+
     def test_capture_writes_a_normal_snapshot(self):
         fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
         hypr = ClientListHypr([self.client("kitty", 1, 1)])
@@ -1007,6 +1010,106 @@ class CaptureTest(unittest.TestCase):
         # ...but the good snapshot on disk must be untouched.
         on_disk = session.read_snapshot(self.path)
         self.assertEqual(on_disk, good)
+
+    # -- rolling backup --------------------------------------------------
+    # The empty-snapshot guard only refuses "0 new over N existing". It
+    # cannot refuse "1 new over 12 existing", and no count threshold can:
+    # a failed restore and the user closing eleven windows look identical.
+    # So the previous snapshot is kept instead, at session.json.1.
+
+    def _seed(self, count):
+        snapshot = {"version": 1, "saved_at": "T", "windows": [
+            {"order": i, "class": f"app{i}", "workspace": 1, "monitor": 0,
+             "floating": False, "at": [0, 0], "size": [100, 100],
+             "fullscreen": 0, "cmd": [f"app{i}"]}
+            for i in range(count)
+        ]}
+        session.write_snapshot(snapshot, self.path)
+        return snapshot
+
+    def test_capture_rotates_the_previous_snapshot_into_a_backup(self):
+        previous = self._seed(3)
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertEqual(
+            [w["class"] for w in session.read_snapshot(self.path)["windows"]],
+            ["kitty"],
+        )
+        self.assertEqual(
+            session.read_snapshot(session.backup_path(self.path)), previous
+        )
+
+    def test_a_shrunken_write_leaves_the_bigger_snapshot_recoverable(self):
+        # The exact incident: "restore: placed 0/8" then "save: wrote 7".
+        self._seed(8)
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertEqual(len(session.read_snapshot(self.path)["windows"]), 1)
+        recovered = session.read_snapshot(session.backup_path(self.path))
+        self.assertEqual(len(recovered["windows"]), 8)
+
+    def test_missing_original_does_not_break_the_write(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertEqual(len(session.read_snapshot(self.path)["windows"]), 1)
+        self.assertFalse(session.backup_path(self.path).exists())
+
+    def test_rotation_failure_is_logged_rather_than_raised(self):
+        self._seed(2)
+        # A directory where the backup file belongs: os.replace onto it
+        # raises IsADirectoryError, an OSError, from inside rotate_snapshot.
+        session.backup_path(self.path).mkdir()
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        # The write still happened...
+        self.assertEqual(len(session.read_snapshot(self.path)["windows"]), 1)
+        # ...and the failure was logged, not raised.
+        self.assertIn(
+            "rotate: could not write session.json.1", self._log()
+        )
+
+    def test_rotation_leaves_no_temp_files_behind(self):
+        self._seed(1)
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertEqual(
+            sorted(p.name for p in self.path.parent.iterdir()),
+            ["session.json", "session.json.1", "session.log"],
+        )
+
+    # -- write logging ---------------------------------------------------
+
+    def test_capture_logs_the_number_of_windows_written(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertIn("capture: wrote 1 window(s)", self._log())
+
+    def test_capture_logs_the_previous_count_so_shrinkage_is_visible(self):
+        self._seed(12)
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        session.capture(
+            ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
+        )
+        self.assertIn("capture: wrote 1 window(s) (previously 12)", self._log())
+
+    def test_a_refused_write_is_not_logged_as_a_write(self):
+        self._seed(4)
+        session.capture(ClientListHypr([]), [], self.proc, self.path)
+        text = self._log()
+        self.assertNotIn("capture: wrote", text)
+        self.assertIn("capture: skipped write", text)
 
 
 class CliTest(unittest.TestCase):
@@ -1150,6 +1253,28 @@ class CliTest(unittest.TestCase):
                          "an exception from restore must not skip watch")
         self.assertIn("restore failed",
                       (session.state_dir() / "session.log").read_text())
+
+    def test_save_does_not_claim_a_write_that_was_refused(self):
+        # capture() refuses to overwrite a good snapshot with an empty one,
+        # but save mode logged "wrote N window(s)" regardless.
+        good = {"version": 1, "saved_at": "T", "windows": [
+            {"order": 0, "class": "kitty", "workspace": 1, "monitor": 0,
+             "floating": False, "at": [0, 0], "size": [10, 10],
+             "fullscreen": 0, "cmd": ["kitty"]},
+        ]}
+        session.write_snapshot(good, session.snapshot_path())
+        original = session.Hypr
+        session.Hypr = FakeHypr  # clients() -> [], as at logout
+        try:
+            self.assertEqual(session.main(["save"]), 0)
+        finally:
+            session.Hypr = original
+        text = (session.state_dir() / "session.log").read_text()
+        self.assertNotIn("save: wrote", text)
+        self.assertIn("save: observed 0 window(s)", text)
+        self.assertIn("capture: skipped write", text)
+        # And the good snapshot is still there.
+        self.assertEqual(session.read_snapshot(session.snapshot_path()), good)
 
     def test_main_save_does_not_raise_when_state_dir_is_unwritable(self):
         # main() must never raise -- not even in save mode when the state

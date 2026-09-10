@@ -65,6 +65,58 @@ def write_snapshot(snapshot: dict, path: pathlib.Path) -> None:
         raise
 
 
+def backup_path(path: pathlib.Path) -> pathlib.Path:
+    """Return the rolling-backup path for a snapshot: session.json.1."""
+    return path.with_name(path.name + ".1")
+
+
+def rotate_snapshot(path: pathlib.Path) -> None:
+    """Copy the current snapshot aside before it is overwritten. Never raises.
+
+    A restore that places few or none of its windows leaves a session with
+    fewer windows than the snapshot described, and the next capture writes
+    that shrunken session over the good snapshot -- observed on this machine
+    as "placed 0/8 window(s)" followed sixteen minutes later by "wrote 7
+    window(s)". The empty-snapshot guard does not catch it, and no
+    fraction-of-previous-count threshold can: it cannot tell a failed restore
+    from the user closing eleven windows.
+
+    So instead of refusing writes, keep the previous one. session.json.1
+    always holds the snapshot that session.json had before the most recent
+    write, and recovering is `cp session.json.1 session.json`.
+
+    Failing to keep a backup must never prevent the write it precedes, so
+    every failure here is logged and swallowed.
+    """
+    backup = backup_path(path)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        # Nothing to roll over yet: the first write of a fresh install.
+        return
+    except OSError as exc:
+        log(f"rotate: could not read {path.name} for backup: {exc}")
+        return
+    try:
+        # Same tmp-then-replace dance as write_snapshot, so a reader never
+        # sees a truncated backup either.
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".session-bak-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, backup)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except OSError as exc:
+        log(f"rotate: could not write {backup.name}: {exc}")
+
+
 def read_snapshot(path: pathlib.Path) -> dict | None:
     """Return the snapshot, or None if it is missing, empty, or malformed.
 
@@ -577,6 +629,11 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     a refused write is logged and skipped -- the snapshot actually observed
     is still returned so callers can see what happened.
 
+    Every write that does happen is preceded by rotate_snapshot(), so the
+    previous snapshot survives at session.json.1. That is the protection
+    against a partial restore quietly writing a shrunken session over a good
+    one, which the empty-snapshot guard above cannot catch.
+
     The write itself is never allowed to propagate: write_snapshot() can
     raise OSError (an unwritable or unreachable state directory, for
     instance) and this must not take down a caller -- main()'s save mode
@@ -585,10 +642,27 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     snapshot = build_snapshot(hypr.clients(), denylist, proc, now)
     if should_write_snapshot(snapshot, path):
+        previous = read_snapshot(path)
+        previous_count = None if previous is None else len(
+            previous.get("windows", []) if isinstance(previous.get("windows"), list)
+            else []
+        )
+        rotate_snapshot(path)
         try:
             write_snapshot(snapshot, path)
         except OSError as exc:
             log(f"capture: failed to write snapshot: {exc}")
+        else:
+            # watch() drives every automatic write through this function, so
+            # without this line the whole snapshotting path is silent and a
+            # snapshot that shrinks from twelve windows to two leaves no
+            # trace of whether the user closed ten or a restore failed.
+            count = len(snapshot["windows"])
+            if previous_count is None:
+                log(f"capture: wrote {count} window(s)")
+            else:
+                log(f"capture: wrote {count} window(s) "
+                    f"(previously {previous_count})")
     else:
         log("capture: skipped write, new snapshot is empty but existing "
             "snapshot is not (likely a logout in progress)")
@@ -625,8 +699,12 @@ def main(argv: list) -> int:
     denylist = load_denylist(denylist_path())
 
     if mode == "save":
+        # "observed", not "wrote": capture() may legitimately refuse the
+        # write (an empty snapshot over a good one), and this line used to
+        # claim a write had happened either way. capture() itself logs the
+        # outcome of the write.
         snapshot = capture(hypr, denylist, proc, path)
-        log(f"save: wrote {len(snapshot['windows'])} window(s)")
+        log(f"save: observed {len(snapshot['windows'])} window(s)")
         return 0
 
     try:
