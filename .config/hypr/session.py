@@ -8,6 +8,7 @@ Standard library only -- socat and jq are not installed on this machine.
 import json
 import os
 import pathlib
+import re
 import tempfile
 
 SCHEMA_VERSION = 1
@@ -120,3 +121,58 @@ def resolve_command(client: dict, proc: pathlib.Path) -> list[str]:
             return [argv[0], flag, cwd]
         return [argv[0]]
     return argv
+
+
+def denylist_path() -> pathlib.Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return pathlib.Path(base) / "hypr" / "session-denylist.txt"
+
+
+def load_denylist(path: pathlib.Path) -> list:
+    """Compile one regex per non-comment line. Invalid patterns are dropped."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    patterns = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            patterns.append(re.compile(line))
+        except re.error:
+            # A typo in the denylist must not break snapshotting.
+            continue
+    return patterns
+
+
+def is_transient(client: dict, clients: list) -> bool:
+    """Approximate 'this window is a dialog of another window'.
+
+    Hyprland's IPC exposes no transient or modal field, so this heuristic
+    stands in for it: a floating window that shares a PID with another
+    window of the same class is treated as that application's dialog.
+    """
+    if not client.get("floating"):
+        return False
+    return any(
+        other is not client
+        and other.get("pid") == client.get("pid")
+        and other.get("class") == client.get("class")
+        and not other.get("floating")
+        for other in clients
+    )
+
+
+def should_skip(client: dict, clients: list, denylist: list,
+                command: list) -> str | None:
+    """Return the reason to skip this window, or None to keep it."""
+    cls = client.get("class", "")
+    if any(pattern.search(cls) for pattern in denylist):
+        return "denylist"
+    if not command:
+        return "no-command"
+    if is_transient(client, clients):
+        return "transient"
+    return None

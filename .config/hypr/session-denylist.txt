@@ -1,0 +1,4 @@
+# One Python regex per line, matched against the Hyprland window class.
+# A matching window is never saved and never restored.
+# Lines starting with # are ignored. Example:
+#   ^steam$

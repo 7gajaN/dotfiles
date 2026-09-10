@@ -146,5 +146,61 @@ class CommandResolutionTest(unittest.TestCase):
         self.assertEqual(session.resolve_command(client, self.proc), [])
 
 
+class FilteringTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.tmp.name) / "denylist.txt"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_denylist_skips_comments_and_blanks(self):
+        self.path.write_text("# a comment\n\n^steam$\ndiscord\n")
+        patterns = session.load_denylist(self.path)
+        self.assertEqual([p.pattern for p in patterns], ["^steam$", "discord"])
+
+    def test_load_denylist_missing_file_is_empty(self):
+        self.assertEqual(session.load_denylist(self.path), [])
+
+    def test_load_denylist_ignores_invalid_regex(self):
+        self.path.write_text("^good$\n[unclosed\n")
+        patterns = session.load_denylist(self.path)
+        self.assertEqual([p.pattern for p in patterns], ["^good$"])
+
+    def test_denylisted_class_is_skipped(self):
+        self.path.write_text("^steam$\n")
+        deny = session.load_denylist(self.path)
+        client = {"class": "steam", "pid": 1, "floating": False}
+        self.assertEqual(
+            session.should_skip(client, [client], deny, ["steam"]), "denylist"
+        )
+
+    def test_empty_command_is_skipped(self):
+        client = {"class": "ghost", "pid": 1, "floating": False}
+        self.assertEqual(
+            session.should_skip(client, [client], [], []), "no-command"
+        )
+
+    def test_floating_sibling_of_same_pid_is_transient(self):
+        main = {"class": "gimp", "pid": 7, "floating": False}
+        dialog = {"class": "gimp", "pid": 7, "floating": True}
+        clients = [main, dialog]
+        self.assertTrue(session.is_transient(dialog, clients))
+        self.assertFalse(session.is_transient(main, clients))
+
+    def test_lone_floating_window_is_not_transient(self):
+        client = {"class": "pavucontrol", "pid": 9, "floating": True}
+        self.assertFalse(session.is_transient(client, [client]))
+
+    def test_floating_window_of_different_pid_is_not_transient(self):
+        a = {"class": "kitty", "pid": 1, "floating": False}
+        b = {"class": "kitty", "pid": 2, "floating": True}
+        self.assertFalse(session.is_transient(b, [a, b]))
+
+    def test_kept_window_returns_none(self):
+        client = {"class": "kitty", "pid": 1, "floating": False}
+        self.assertIsNone(session.should_skip(client, [client], [], ["kitty"]))
+
+
 if __name__ == "__main__":
     unittest.main()
