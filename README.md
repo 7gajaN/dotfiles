@@ -148,8 +148,11 @@ can never launch anything.
 Two trade-offs are accepted as part of this design:
 
 - **Only one program per terminal, chosen from a fixed list.** Anything not
-  in `ALLOWLIST` is invisible to restore, and only the first allowlisted
-  match found among the shell's children is used.
+  in `ALLOWLIST` is invisible to restore. When the terminal has a child
+  shell, only an allowlisted match among that shell's own children is used;
+  when it does not (as after a `-e <program>` restore, where the program is
+  the terminal's direct child instead), an allowlisted direct child is used
+  instead. The shell is preferred whenever one is present.
 - **`-e` means quitting the program closes the window.** The window does not
   drop back to a shell on exit, unlike a terminal opened normally.
 
