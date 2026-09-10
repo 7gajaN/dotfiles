@@ -302,5 +302,171 @@ class EventParsingTest(unittest.TestCase):
         )
 
 
+class FakeHypr:
+    def __init__(self):
+        self.execs = []
+        self.dispatches = []
+
+    def exec_with_rules(self, rules, argv):
+        self.execs.append((rules, argv))
+        return True
+
+    def dispatch(self, args):
+        self.dispatches.append(args)
+        return True
+
+    def clients(self):
+        return []
+
+
+class FailingHypr(FakeHypr):
+    def exec_with_rules(self, rules, argv):
+        self.execs.append((rules, argv))
+        return False
+
+
+class FakeEvents:
+    """Yields one openwindow per call, from a scripted list."""
+
+    def __init__(self, scripted):
+        self.scripted = list(scripted)
+
+    def events(self, timeout=None):
+        if self.scripted:
+            yield self.scripted.pop(0)
+
+
+class SilentEvents:
+    def events(self, timeout=None):
+        return iter(())
+
+
+def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0):
+    return {
+        "order": order, "class": cls, "workspace": ws, "monitor": 0,
+        "floating": floating, "at": list(at), "size": list(size),
+        "fullscreen": fs, "cmd": [cls],
+    }
+
+
+class RestoreCommandTest(unittest.TestCase):
+    def test_first_window_of_class_is_unmodified(self):
+        seen = {}
+        self.assertEqual(
+            session.restore_command(window(0, "firefox", 1), seen), ["firefox"]
+        )
+
+    def test_second_window_of_class_gets_quirk_arguments(self):
+        seen = {}
+        session.restore_command(window(0, "firefox", 1), seen)
+        self.assertEqual(
+            session.restore_command(window(1, "firefox", 2), seen),
+            ["firefox", "--new-window"],
+        )
+
+    def test_class_without_quirk_is_never_modified(self):
+        seen = {}
+        session.restore_command(window(0, "kitty", 1), seen)
+        self.assertEqual(
+            session.restore_command(window(1, "kitty", 2), seen), ["kitty"]
+        )
+
+
+class RestoreTest(unittest.TestCase):
+    def test_places_each_window_on_its_workspace(self):
+        hypr = FakeHypr()
+        events = FakeEvents([
+            ("openwindow", "0xa,1,kitty,t"),
+            ("openwindow", "0xb,10,firefox,t"),
+        ])
+        snap = {"version": 1, "windows": [
+            window(0, "kitty", 1), window(1, "firefox", 10),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 2)
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent", ["kitty"]),
+             ("workspace 10 silent", ["firefox"])],
+        )
+
+    def test_restores_windows_in_order_field_not_list_order(self):
+        hypr = FakeHypr()
+        events = FakeEvents([
+            ("openwindow", "0xa,1,kitty,t"),
+            ("openwindow", "0xb,2,mpv,t"),
+        ])
+        snap = {"version": 1, "windows": [
+            window(1, "mpv", 2), window(0, "kitty", 1),
+        ]}
+        session.restore(snap, hypr, events)
+        self.assertEqual([argv[0] for _rules, argv in hypr.execs], ["kitty", "mpv"])
+
+    def test_floating_window_gets_geometry_dispatches(self):
+        hypr = FakeHypr()
+        events = FakeEvents([("openwindow", "0xa,1,mpv,t")])
+        snap = {"version": 1, "windows": [
+            window(0, "mpv", 1, floating=True, at=(5, 6), size=(640, 480)),
+        ]}
+        session.restore(snap, hypr, events)
+        self.assertIn("setfloating address:0xa", hypr.dispatches)
+        self.assertIn("movewindowpixel exact 5 6,address:0xa", hypr.dispatches)
+        self.assertIn("resizewindowpixel exact 640 480,address:0xa", hypr.dispatches)
+
+    def test_tiled_window_gets_no_geometry_dispatches(self):
+        hypr = FakeHypr()
+        events = FakeEvents([("openwindow", "0xa,1,kitty,t")])
+        snap = {"version": 1, "windows": [window(0, "kitty", 1)]}
+        session.restore(snap, hypr, events)
+        self.assertEqual(hypr.dispatches, [])
+
+    def test_fullscreen_window_is_refocused_and_fullscreened(self):
+        hypr = FakeHypr()
+        events = FakeEvents([("openwindow", "0xa,1,mpv,t")])
+        snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=1)]}
+        session.restore(snap, hypr, events)
+        self.assertIn("focuswindow address:0xa", hypr.dispatches)
+        self.assertIn("fullscreen 1", hypr.dispatches)
+
+    def test_failed_launch_does_not_stop_the_next_window(self):
+        hypr = FailingHypr()
+        snap = {"version": 1, "windows": [
+            window(0, "broken", 1), window(1, "kitty", 2),
+        ]}
+        placed = session.restore(snap, hypr, SilentEvents())
+        self.assertEqual(placed, 0)
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["broken", "kitty"])
+
+    def test_window_that_never_maps_is_abandoned_after_timeout(self):
+        # A clock that advances 5s per reading crosses the 10s per-window
+        # deadline without ever running out of values.
+        hypr = FakeHypr()
+        ticks = itertools.count(0.0, 5.0)
+        placed = session.restore(
+            {"version": 1, "windows": [window(0, "kitty", 1)]},
+            hypr, SilentEvents(), clock=lambda: next(ticks),
+        )
+        self.assertEqual(placed, 0)
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
+
+    def test_total_timeout_abandons_remaining_windows(self):
+        # 200s per reading exceeds the 120s budget on the first check, so
+        # nothing is ever launched.
+        hypr = FakeHypr()
+        ticks = itertools.count(0.0, 200.0)
+        placed = session.restore(
+            {"version": 1, "windows": [window(0, "a", 1), window(1, "b", 2)]},
+            hypr, SilentEvents(), clock=lambda: next(ticks),
+        )
+        self.assertEqual(placed, 0)
+        self.assertEqual(hypr.execs, [])
+
+    def test_empty_snapshot_is_a_no_op(self):
+        hypr = FakeHypr()
+        self.assertEqual(
+            session.restore({"version": 1, "windows": []}, hypr, SilentEvents()), 0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import shlex
 import socket
 import subprocess
 import tempfile
+import time
 
 SCHEMA_VERSION = 1
 
@@ -321,3 +322,83 @@ class EventSocket:
             self.sock.close()
         except OSError:
             pass
+
+
+# Applications that focus an existing window instead of opening a new one.
+# The listed arguments are added from the second window of that class onward.
+# Expect to add entries here as single-instance applications are encountered.
+QUIRKS = {"firefox": ["--new-window"]}
+
+
+def restore_command(window: dict, seen: dict) -> list:
+    """Return the argv for this window, applying single-instance quirks."""
+    cls = window["class"]
+    count = seen.get(cls, 0)
+    seen[cls] = count + 1
+    argv = list(window["cmd"])
+    if count and cls in QUIRKS:
+        argv.extend(QUIRKS[cls])
+    return argv
+
+
+def _await_window(events, cls: str, deadline: float, clock) -> str | None:
+    """Wait for an openwindow event whose class matches. Return its address."""
+    while clock() < deadline:
+        for name, payload in events.events(timeout=0.25):
+            if name != "openwindow":
+                continue
+            parts = payload.split(",", 3)
+            if len(parts) >= 3 and parts[2] == cls:
+                return parts[0]
+    return None
+
+
+def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
+            total_timeout: float = 120.0, clock=time.monotonic) -> int:
+    """Relaunch each saved window onto its workspace, one at a time.
+
+    Serial by design: with several windows of the same class, parallel launches
+    give no guarantee about which window arrives first, so windows can land on
+    the wrong workspace.
+
+    Returns the count of windows confirmed placed. Never raises -- a failure at
+    any point degrades to a log line, because restore must not block login.
+    """
+    windows = sorted(snapshot.get("windows", []), key=lambda w: w["order"])
+    started = clock()
+    seen: dict = {}
+    placed = 0
+
+    for window in windows:
+        if clock() - started > total_timeout:
+            log(f"restore: total timeout, abandoning {len(windows) - placed} window(s)")
+            break
+
+        argv = restore_command(window, seen)
+        rules = f"workspace {window['workspace']} silent"
+        if not hypr.exec_with_rules(rules, argv):
+            log(f"restore: launch failed for {window['class']}")
+            continue
+
+        address = _await_window(
+            events, window["class"], clock() + per_window_timeout, clock
+        )
+        if not address:
+            log(f"restore: {window['class']} did not map in {per_window_timeout}s")
+            continue
+
+        if window.get("floating"):
+            x, y = window["at"]
+            w, h = window["size"]
+            hypr.dispatch(f"setfloating address:{address}")
+            hypr.dispatch(f"movewindowpixel exact {x} {y},address:{address}")
+            hypr.dispatch(f"resizewindowpixel exact {w} {h},address:{address}")
+
+        if window.get("fullscreen"):
+            hypr.dispatch(f"focuswindow address:{address}")
+            hypr.dispatch(f"fullscreen {window['fullscreen']}")
+
+        placed += 1
+
+    log(f"restore: placed {placed}/{len(windows)} window(s)")
+    return placed
