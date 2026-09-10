@@ -49,7 +49,7 @@ def read_snapshot(path: pathlib.Path) -> dict | None:
     """
     try:
         text = path.read_text()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     if not text.strip():
         return None

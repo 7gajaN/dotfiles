@@ -50,6 +50,35 @@ class SnapshotIOTest(unittest.TestCase):
         session.write_snapshot({"version": 1, "windows": []}, nested)
         self.assertTrue(nested.exists())
 
+    def test_read_invalid_utf8_returns_none(self):
+        self.path.write_bytes(b'\xff\xfe\x00\x01invalid-bytes-not-utf8-\x80\x81')
+        self.assertIsNone(session.read_snapshot(self.path))
+
+    def test_state_dir_respects_xdg_state_home(self):
+        old_xdg = os.environ.get("XDG_STATE_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.environ["XDG_STATE_HOME"] = tmpdir
+                result = session.state_dir()
+                self.assertEqual(result, pathlib.Path(tmpdir) / "hypr-session")
+        finally:
+            if old_xdg is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = old_xdg
+
+    def test_state_dir_fallback_without_xdg_state_home(self):
+        old_xdg = os.environ.get("XDG_STATE_HOME")
+        try:
+            os.environ.pop("XDG_STATE_HOME", None)
+            result = session.state_dir()
+            self.assertTrue(str(result).endswith("/.local/state/hypr-session"))
+        finally:
+            if old_xdg is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = old_xdg
+
 
 if __name__ == "__main__":
     unittest.main()
