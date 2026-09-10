@@ -3,6 +3,7 @@ import itertools
 import json
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -272,6 +273,17 @@ class FilteringTest(unittest.TestCase):
         self.assertTrue(session.is_transient(dialog, clients))
         self.assertFalse(session.is_transient(main, clients))
 
+    def test_two_floating_siblings_are_both_kept(self):
+        # The heuristic is "a floating window whose main window is also
+        # open". Two floating windows sharing a pid and class have no main
+        # window between them, so neither is a dialog -- and if the
+        # non-floating requirement were dropped they would classify each
+        # other as transient and both would vanish from the snapshot.
+        a = {"class": "gimp", "pid": 7, "floating": True}
+        b = {"class": "gimp", "pid": 7, "floating": True}
+        self.assertFalse(session.is_transient(a, [a, b]))
+        self.assertFalse(session.is_transient(b, [a, b]))
+
     def test_lone_floating_window_is_not_transient(self):
         client = {"class": "pavucontrol", "pid": 9, "floating": True}
         self.assertFalse(session.is_transient(client, [client]))
@@ -359,6 +371,23 @@ class BuildSnapshotTest(unittest.TestCase):
         self.assertEqual(w["fullscreen"], 2)
         self.assertTrue(w["floating"])
 
+    def test_denylisted_windows_are_left_out_of_the_snapshot(self):
+        # should_skip is tested against a denylist directly, but nothing
+        # proved build_snapshot actually passes one through. The denylist is
+        # the spec's "reliable control" for windows the heuristic gets
+        # wrong, so the wiring matters as much as the matching.
+        for pid, cls in ((1, "kitty"), (2, "steam")):
+            fake_proc(self.proc, pid, [cls], cls, "/home/u")
+        clients = [self.client("kitty", 1, 1), self.client("steam", 2, 2)]
+        deny = [re.compile("^steam$")]
+        snap = session.build_snapshot(clients, deny, self.proc, "T")
+        self.assertEqual([w["class"] for w in snap["windows"]], ["kitty"])
+        # ...and with no denylist the same window is kept, so the test is
+        # about the denylist rather than about steam.
+        snap = session.build_snapshot(clients, [], self.proc, "T")
+        self.assertEqual([w["class"] for w in snap["windows"]],
+                         ["kitty", "steam"])
+
     def test_special_workspace_windows_are_left_out_of_the_snapshot(self):
         for pid, cls in ((1, "kitty"), (2, "pad")):
             fake_proc(self.proc, pid, [cls], cls, "/home/u")
@@ -399,10 +428,131 @@ class EventParsingTest(unittest.TestCase):
     def test_blank_line_returns_none(self):
         self.assertIsNone(session.parse_event(""))
 
-    def test_window_events_set_contents(self):
+    # The membership of WINDOW_EVENTS is covered behaviourally by
+    # WatchTest.test_each_window_event_triggers_a_snapshot and
+    # WatchTest.test_non_window_events_never_trigger_a_snapshot, which say
+    # what the set is for rather than restating its literal contents.
+
+
+class ChunkedSocket:
+    """A socket whose recv() hands back a scripted sequence of chunks."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.closed = False
+
+    def recv(self, size):
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def close(self):
+        self.closed = True
+
+
+class EventSocketTest(unittest.TestCase):
+    """EventSocket is on the login path and had no coverage at all.
+
+    Instances are built without connecting: __init__ would need a live
+    compositor, and what is under test is the buffering, not the connect.
+    """
+
+    def make(self, chunks):
+        sock = session.EventSocket.__new__(session.EventSocket)
+        sock.path = "/fake/hypr/instance/.socket2.sock"
+        sock.sock = ChunkedSocket(chunks)
+        sock.buffer = ""
+        return sock
+
+    def read(self, event_socket, ready=True):
+        selected = ([event_socket.sock], [], []) if ready else ([], [], [])
+        with mock.patch.object(session.select, "select", return_value=selected):
+            return list(event_socket.events(timeout=0))
+
+    def test_a_line_split_across_two_reads_is_reassembled(self):
+        # A recv() boundary can fall anywhere. Dropping the partial line
+        # would silently lose an openwindow event, which on the restore
+        # path means a window is reported as never having mapped.
+        socket_ = self.make([b"openwindow>>0xa,1,ki", b"tty,a title\n"])
+        self.assertEqual(self.read(socket_), [])
         self.assertEqual(
-            session.WINDOW_EVENTS,
-            frozenset({"openwindow", "closewindow", "movewindow", "movewindowv2"}),
+            self.read(socket_), [("openwindow", "0xa,1,kitty,a title")]
+        )
+
+    def test_a_trailing_partial_line_is_held_for_the_next_read(self):
+        socket_ = self.make([b"closewindow>>0xa\nopenwin", b"dow>>0xb,1,mpv,t\n"])
+        self.assertEqual(self.read(socket_), [("closewindow", "0xa")])
+        self.assertEqual(socket_.buffer, "openwin")
+        self.assertEqual(self.read(socket_), [("openwindow", "0xb,1,mpv,t")])
+
+    def test_several_events_in_one_chunk_are_all_yielded(self):
+        socket_ = self.make([b"openwindow>>0xa,1,kitty,t\nclosewindow>>0xa\n"])
+        self.assertEqual(
+            self.read(socket_),
+            [("openwindow", "0xa,1,kitty,t"), ("closewindow", "0xa")],
+        )
+
+    def test_nothing_ready_yields_nothing_and_does_not_read(self):
+        socket_ = self.make([b"openwindow>>0xa,1,kitty,t\n"])
+        self.assertEqual(self.read(socket_, ready=False), [])
+        self.assertEqual(len(socket_.sock.chunks), 1)
+
+    def test_a_closed_socket_raises_connection_error(self):
+        # This is the signal watch() reconnects on.
+        socket_ = self.make([b""])
+        with self.assertRaises(ConnectionError):
+            self.read(socket_)
+
+    def test_close_is_safe(self):
+        socket_ = self.make([])
+        socket_.close()
+        self.assertTrue(socket_.sock.closed)
+
+
+class HyprClientsTest(unittest.TestCase):
+    """Hypr.clients() must return [] on every failure rather than raise.
+
+    That empty list is what feeds should_write_snapshot's guard, so a
+    hyprctl that fails during logout teardown ends up protecting the
+    snapshot rather than destroying it.
+    """
+
+    def clients_with(self, **run_kwargs):
+        hypr = session.Hypr()
+        with mock.patch.object(session.subprocess, "run", **run_kwargs):
+            return hypr.clients()
+
+    def test_subprocess_failure_returns_empty_list(self):
+        self.assertEqual(
+            self.clients_with(
+                side_effect=session.subprocess.SubprocessError("hyprctl died")
+            ),
+            [],
+        )
+
+    def test_timeout_returns_empty_list(self):
+        self.assertEqual(
+            self.clients_with(
+                side_effect=session.subprocess.TimeoutExpired("hyprctl", 10)
+            ),
+            [],
+        )
+
+    def test_missing_binary_returns_empty_list(self):
+        self.assertEqual(
+            self.clients_with(side_effect=FileNotFoundError("hyprctl")), []
+        )
+
+    def test_invalid_json_returns_empty_list(self):
+        self.assertEqual(
+            self.clients_with(return_value=mock.Mock(stdout="not json at all")),
+            [],
+        )
+
+    def test_valid_json_is_returned(self):
+        self.assertEqual(
+            self.clients_with(
+                return_value=mock.Mock(stdout='[{"class": "kitty"}]')
+            ),
+            [{"class": "kitty"}],
         )
 
 
@@ -1405,6 +1555,18 @@ class CaptureTest(unittest.TestCase):
             ClientListHypr([self.client("kitty", 1, 1)]), [], self.proc, self.path
         )
         self.assertIn("capture: wrote 1 window(s) (previously 12)", self._log())
+
+    def test_a_failing_hyprctl_cannot_destroy_the_good_snapshot(self):
+        # The end of the chain that Hypr.clients()'s empty list feeds: a
+        # hyprctl that fails (as it does while the compositor is shutting
+        # down) yields no clients, which the empty-snapshot guard then
+        # refuses to write over a good snapshot.
+        good = self._seed(5)
+        hypr = session.Hypr()
+        with mock.patch.object(session.subprocess, "run",
+                               side_effect=OSError("no hyprctl")):
+            session.capture(hypr, [], self.proc, self.path)
+        self.assertEqual(session.read_snapshot(self.path), good)
 
     def test_a_refused_write_is_not_logged_as_a_write(self):
         self._seed(4)
