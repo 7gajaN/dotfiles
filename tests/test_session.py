@@ -178,6 +178,48 @@ class CommandResolutionTest(unittest.TestCase):
         client = {"class": "kitty", "pid": 30}
         self.assertEqual(session.resolve_command(client, self.proc), ["kitty"])
 
+    def test_quirk_arguments_are_not_captured_into_the_snapshot(self):
+        # A Firefox window that this tool restored carries --new-window in
+        # its own /proc cmdline. Saving it verbatim would put the flag in
+        # the snapshot, where restore adds another copy for the second
+        # window of that class.
+        fake_proc(self.proc, 10, ["firefox", "--new-window"], "firefox", "/home/u")
+        client = {"class": "firefox", "pid": 10}
+        self.assertEqual(session.resolve_command(client, self.proc), ["firefox"])
+
+    def test_other_arguments_of_a_quirked_class_survive(self):
+        fake_proc(self.proc, 11, ["firefox", "-P", "work", "--new-window"],
+                  "firefox", "/home/u")
+        client = {"class": "firefox", "pid": 11}
+        self.assertEqual(
+            session.resolve_command(client, self.proc), ["firefox", "-P", "work"]
+        )
+
+    def test_restore_then_save_does_not_accumulate_quirk_arguments(self):
+        # One full cycle: two saved firefox windows -> restore adds
+        # --new-window to the second -> that argv is what /proc reports on
+        # the next capture -> the next snapshot must look like the first.
+        saved = [["firefox"], ["firefox"]]
+        for _cycle in range(3):
+            seen = {}
+            launched = [
+                session.restore_command({"class": "firefox", "cmd": cmd}, seen)
+                for cmd in saved
+            ]
+            self.assertEqual(launched, [["firefox"], ["firefox", "--new-window"]])
+            # Those launched processes are now what /proc reports.
+            recaptured = []
+            for pid, argv in enumerate(launched, start=100):
+                proc_dir = self.proc / str(pid)
+                if not proc_dir.exists():
+                    fake_proc(self.proc, pid, argv, "firefox", "/home/u")
+                recaptured.append(
+                    session.resolve_command({"class": "firefox", "pid": pid},
+                                            self.proc)
+                )
+            self.assertEqual(recaptured, [["firefox"], ["firefox"]])
+            saved = recaptured
+
     def test_unreadable_process_yields_empty_command(self):
         client = {"class": "ghost", "pid": 4242}
         self.assertEqual(session.resolve_command(client, self.proc), [])
@@ -826,6 +868,23 @@ class ExecWithRulesLuaEscapingTest(unittest.TestCase):
         raw = 'a "quoted" \\ path'
         self.assertEqual(
             session.Hypr._lua_quote(raw), 'a \\"quoted\\" \\\\ path'
+        )
+
+    def test_lua_quote_escapes_newlines(self):
+        # A Lua short-string literal cannot contain a raw newline: it would
+        # be an unterminated string, not a launch. /proc/<pid>/cmdline can
+        # in principle hold one.
+        self.assertEqual(session.Hypr._lua_quote("a\nb\r\n"), "a\\nb\\r\\n")
+
+    def test_newline_in_an_argument_stays_inside_the_lua_string(self):
+        lua_expr = self._dispatched_lua_expr(
+            "workspace 1 silent", ["kitty", "--title", "two\nlines"]
+        )
+        self.assertNotIn("\n", lua_expr)
+        self.assertEqual(
+            lua_expr,
+            'hl.dsp.exec_cmd("[workspace 1 silent] kitty --title '
+            '\'two\\nlines\'")',
         )
 
 

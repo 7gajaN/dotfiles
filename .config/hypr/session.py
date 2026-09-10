@@ -150,6 +150,28 @@ TERMINALS = {"kitty": "--directory"}
 
 SHELLS = frozenset({"zsh", "bash", "fish", "sh", "dash"})
 
+# Applications that focus an existing window instead of opening a new one.
+# The listed arguments are added at restore time, from the second window of
+# that class onward. Expect to add entries here as single-instance
+# applications are encountered.
+QUIRKS = {"firefox": ["--new-window"]}
+
+
+def strip_quirk_arguments(cls: str, argv: list) -> list:
+    """Drop restore-time quirk arguments from a captured command line.
+
+    QUIRKS arguments belong to the restore side only. A Firefox window that
+    this tool restored carries --new-window in its own /proc cmdline, so
+    saving that verbatim would put the flag in the snapshot, restore would
+    add a second copy for the second window, and the flag would accrete on
+    every save/restore cycle. Strip them at capture time and the snapshot
+    stays the command the user actually meant.
+    """
+    quirk_args = QUIRKS.get(cls)
+    if not quirk_args or not argv:
+        return argv
+    return [argv[0]] + [arg for arg in argv[1:] if arg not in quirk_args]
+
 
 def read_cmdline(pid: int, proc: pathlib.Path) -> list[str]:
     """Return the process argv, or an empty list when it cannot be read."""
@@ -198,13 +220,14 @@ def resolve_command(client: dict, proc: pathlib.Path) -> list[str]:
     argv = read_cmdline(client["pid"], proc)
     if not argv:
         return []
-    flag = TERMINALS.get(client["class"])
+    cls = client["class"]
+    flag = TERMINALS.get(cls)
     if flag:
         cwd = child_shell_cwd(client["pid"], proc)
         if cwd:
             return [argv[0], flag, cwd]
         return [argv[0]]
-    return argv
+    return strip_quirk_arguments(cls, argv)
 
 
 def denylist_path() -> pathlib.Path:
@@ -354,8 +377,20 @@ class Hypr:
 
     @staticmethod
     def _lua_quote(text: str) -> str:
-        """Escape text for embedding inside a Lua double-quoted string literal."""
-        return text.replace("\\", "\\\\").replace('"', '\\"')
+        """Escape text for embedding inside a Lua double-quoted string literal.
+
+        Backslash first, or the escapes introduced afterwards get escaped
+        again. Newlines and carriage returns matter too: a Lua short string
+        literal cannot contain a raw one, so an argv that holds a newline --
+        /proc/<pid>/cmdline can in principle hold anything -- would produce
+        an unterminated-string error rather than a launch.
+        """
+        return (
+            text.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+        )
 
     def exec_with_rules(self, rules: str, argv: list) -> bool:
         """Run 'hyprctl dispatch exec [rules] cmd' via the Lua dispatcher.
@@ -414,14 +449,13 @@ class EventSocket:
             pass
 
 
-# Applications that focus an existing window instead of opening a new one.
-# The listed arguments are added from the second window of that class onward.
-# Expect to add entries here as single-instance applications are encountered.
-QUIRKS = {"firefox": ["--new-window"]}
-
-
 def restore_command(window: dict, seen: dict) -> list:
-    """Return the argv for this window, applying single-instance quirks."""
+    """Return the argv for this window, applying single-instance quirks.
+
+    The QUIRKS table lives beside strip_quirk_arguments() at the top of the
+    file: these arguments are added here, at restore time, and stripped
+    again at capture time so they cannot accumulate in the snapshot.
+    """
     cls = window["class"]
     count = seen.get(cls, 0)
     seen[cls] = count + 1
