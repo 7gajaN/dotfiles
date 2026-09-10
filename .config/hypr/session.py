@@ -255,6 +255,13 @@ def should_skip(client: dict, clients: list, denylist: list,
     cls = client.get("class", "")
     if any(pattern.search(cls) for pattern in denylist):
         return "denylist"
+    workspace = client.get("workspace") or {}
+    if workspace.get("id", 0) < 0:
+        # Special workspaces (the scratchpad) carry a negative id, but
+        # Hyprland addresses them by name -- `special:magic`, not `-98`. A
+        # rule of `workspace -98 silent` is meaningless, so these windows
+        # are not captured at all rather than restored to the wrong place.
+        return "special-workspace"
     if not command:
         return "no-command"
     if is_transient(client, clients):
@@ -523,7 +530,16 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
                 rule_parts.append("float")
                 rule_parts.append(f"move {x} {y}")
                 rule_parts.append(f"size {w} {h}")
-            if window.get("fullscreen"):
+            # hyprctl reports fullscreen as 0 (none), 1 (maximized) or 2
+            # (true fullscreen), and only 2 gets the rule. Emitting
+            # `fullscreen` for a maximized window makes it come back
+            # genuinely fullscreen; the next capture then records 2, and the
+            # window can never get back to maximized. The rule name that
+            # would restore maximize could not be verified without
+            # dispatching against the live session, so maximized state is
+            # deliberately not restored at all -- not restoring it is
+            # recoverable, silently converting it is not.
+            if window.get("fullscreen") == 2:
                 rule_parts.append("fullscreen")
             rules = "; ".join(rule_parts)
             if not hypr.exec_with_rules(rules, argv):

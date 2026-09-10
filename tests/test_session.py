@@ -239,6 +239,22 @@ class FilteringTest(unittest.TestCase):
         b = {"class": "kitty", "pid": 2, "floating": True}
         self.assertFalse(session.is_transient(b, [a, b]))
 
+    def test_special_workspace_window_is_skipped(self):
+        # Scratchpad windows report a negative workspace id, but Hyprland
+        # addresses them as special:<name>. `workspace -98 silent` is not a
+        # rule that means anything.
+        client = {"class": "kitty", "pid": 1, "floating": True,
+                  "workspace": {"id": -98, "name": "special:magic"}}
+        self.assertEqual(
+            session.should_skip(client, [client], [], ["kitty"]),
+            "special-workspace",
+        )
+
+    def test_normal_workspace_window_is_not_skipped_for_its_workspace(self):
+        client = {"class": "kitty", "pid": 1, "floating": False,
+                  "workspace": {"id": 1, "name": "1"}}
+        self.assertIsNone(session.should_skip(client, [client], [], ["kitty"]))
+
     def test_kept_window_returns_none(self):
         client = {"class": "kitty", "pid": 1, "floating": False}
         self.assertIsNone(session.should_skip(client, [client], [], ["kitty"]))
@@ -300,6 +316,15 @@ class BuildSnapshotTest(unittest.TestCase):
         self.assertEqual(w["size"], [800, 600])
         self.assertEqual(w["fullscreen"], 2)
         self.assertTrue(w["floating"])
+
+    def test_special_workspace_windows_are_left_out_of_the_snapshot(self):
+        for pid, cls in ((1, "kitty"), (2, "pad")):
+            fake_proc(self.proc, pid, [cls], cls, "/home/u")
+        scratch = self.client("pad", 2, -98)
+        snap = session.build_snapshot(
+            [self.client("kitty", 1, 1), scratch], [], self.proc, "T"
+        )
+        self.assertEqual([w["class"] for w in snap["windows"]], ["kitty"])
 
     def test_skipped_windows_are_absent_and_do_not_gap_order(self):
         fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
@@ -506,14 +531,27 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(hypr.execs, [("workspace 1 silent", ["kitty"])])
 
     def test_fullscreen_window_gets_fullscreen_rule(self):
+        # hyprctl's fullscreen field is 0/1/2 and only 2 is true fullscreen.
+        # This test used to pass fs=1, which is "maximized".
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
-        snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=1)]}
+        snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=2)]}
         session.restore(snap, hypr, events)
         self.assertEqual(
             hypr.execs,
             [("workspace 1 silent; fullscreen", ["mpv"])],
         )
+
+    def test_maximized_window_does_not_get_the_fullscreen_rule(self):
+        # fullscreen == 1 is maximized. Restoring it as true fullscreen is a
+        # one-way trip: the window comes back fullscreen, the next capture
+        # records 2, and it can never return to maximized. Not restoring the
+        # state is recoverable; silently converting it is not.
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
+        snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=1)]}
+        session.restore(snap, hypr, events)
+        self.assertEqual(hypr.execs, [("workspace 1 silent", ["mpv"])])
 
     def test_failed_launch_does_not_stop_the_next_window(self):
         hypr = FailingHypr()
