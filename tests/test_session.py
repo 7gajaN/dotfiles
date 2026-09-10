@@ -317,6 +317,33 @@ class ProgramDetectionTest(unittest.TestCase):
         self.assertEqual(session.child_program(54, self.proc), "claude")
         self.assertEqual(session.child_shell_cwd(54, self.proc), str(shell_cwd))
 
+    def test_shell_grandchild_wins_over_a_decoy_direct_child_listed_first(self):
+        # Reproduces the bug found in review: a single linear pass that
+        # checks `elif comm in ALLOWLIST` on a direct child returns as soon
+        # as it sees an allowlisted direct child, even when a shell child
+        # (whose grandchild is a different allowlisted program) appears
+        # later in /proc's child order. The shell must win regardless of
+        # where it falls in that order, exactly as child_shell_cwd already
+        # guarantees via its own two-pass walk. This needs a second
+        # ALLOWLIST entry to be observable, so it is patched in here and
+        # restored afterwards -- the shipped table stays untouched.
+        original_allowlist = session.ALLOWLIST
+        session.ALLOWLIST = {"claude": ["claude", "--continue"], "vim": ["vim"]}
+        try:
+            fake_proc(self.proc, 70, ["kitty"], "kitty", "/home/u",
+                      children=[71, 72])
+            # Decoy: an allowlisted direct child listed BEFORE the shell.
+            fake_proc(self.proc, 71, ["vim", "notes.txt"], "vim", "/home/u")
+            # Shell child, listed second, whose grandchild is the real
+            # allowlisted program.
+            fake_proc(self.proc, 72, ["-zsh"], "zsh", "/home/u/project",
+                      children=[73])
+            fake_proc(self.proc, 73, ["claude", "--continue"], "claude",
+                      "/home/u/project")
+            self.assertEqual(session.child_program(70, self.proc), "claude")
+        finally:
+            session.ALLOWLIST = original_allowlist
+
     def test_direct_non_allowlisted_child_is_ignored_by_both_walks(self):
         # The important negative case: the fallback must not turn any
         # random direct child into a program or a cwd source -- ALLOWLIST

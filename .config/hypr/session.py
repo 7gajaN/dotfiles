@@ -252,15 +252,22 @@ def child_program(pid: int, proc: pathlib.Path) -> str | None:
     therefore also checked against ALLOWLIST, on the same terms as a
     grandchild -- membership is still the only gate, so this widens where a
     match can be found, never what counts as one.
+
+    Mirrors child_shell_cwd's two-pass shape: pass 1 walks shell children
+    and their grandchildren; only if that finds nothing does pass 2 look
+    for an allowlisted direct child. This makes the shell's precedence
+    structural rather than dependent on /proc child ordering.
     """
-    for child in _children(pid, proc):
-        comm = _comm(child, proc)
-        if comm in SHELLS:
+    children = _children(pid, proc)
+    for child in children:
+        if _comm(child, proc) in SHELLS:
             for grandchild in _children(child, proc):
                 name = _comm(grandchild, proc)
                 if name in ALLOWLIST:
                     return name
-        elif comm in ALLOWLIST:
+    for child in children:
+        comm = _comm(child, proc)
+        if comm in ALLOWLIST:
             return comm
     return None
 
