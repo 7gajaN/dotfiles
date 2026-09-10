@@ -15,6 +15,31 @@ session = importlib.util.module_from_spec(spec)
 sys.modules["session"] = session
 spec.loader.exec_module(session)
 
+# log() is file-backed (Task 8) and many tests exercise code paths that call
+# it incidentally (build_snapshot's skip log, restore's and watch's status
+# log lines) without themselves caring about logging. Redirect XDG_STATE_HOME
+# for the whole module so none of that incidental logging ever lands in the
+# real ~/.local/state/hypr-session/session.log. Individual test classes
+# (CliTest, CaptureTest) still manage their own XDG_STATE_HOME within this
+# sandbox to assert on log/snapshot content directly.
+_module_state_tmp = None
+_saved_xdg_state_home = None
+
+
+def setUpModule():
+    global _module_state_tmp, _saved_xdg_state_home
+    _module_state_tmp = tempfile.TemporaryDirectory()
+    _saved_xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    os.environ["XDG_STATE_HOME"] = str(pathlib.Path(_module_state_tmp.name) / "state")
+
+
+def tearDownModule():
+    if _saved_xdg_state_home is None:
+        os.environ.pop("XDG_STATE_HOME", None)
+    else:
+        os.environ["XDG_STATE_HOME"] = _saved_xdg_state_home
+    _module_state_tmp.cleanup()
+
 
 class SnapshotIOTest(unittest.TestCase):
     def setUp(self):
@@ -727,6 +752,130 @@ class WatchTest(unittest.TestCase):
         # Must return normally rather than propagate the exception.
         session.watch(FakeHypr(), events, boom, debounce=1.0,
                       clock=lambda: next(ticks), stop=stop)
+
+
+class ClientListHypr(FakeHypr):
+    """A FakeHypr whose clients() returns a fixed, caller-supplied list."""
+
+    def __init__(self, clients):
+        super().__init__()
+        self._clients = clients
+
+    def clients(self):
+        return self._clients
+
+
+class CaptureTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.tmp.name)
+        self.env = {
+            "XDG_STATE_HOME": str(self.home / "state"),
+            "XDG_CONFIG_HOME": str(self.home / "config"),
+        }
+        self.saved = {k: os.environ.get(k) for k in self.env}
+        os.environ.update(self.env)
+        self.proc = self.home / "proc"
+        self.proc.mkdir()
+        self.path = self.home / "state" / "hypr-session" / "session.json"
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def client(self, cls, pid, ws):
+        return {
+            "class": cls, "pid": pid, "floating": False,
+            "workspace": {"id": ws, "name": str(ws)},
+            "monitor": 0, "at": [0, 0], "size": [100, 100], "fullscreen": 0,
+        }
+
+    def test_capture_writes_a_normal_snapshot(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        hypr = ClientListHypr([self.client("kitty", 1, 1)])
+        snapshot = session.capture(hypr, [], self.proc, self.path)
+        self.assertEqual(len(snapshot["windows"]), 1)
+        on_disk = session.read_snapshot(self.path)
+        self.assertEqual(on_disk, snapshot)
+
+    def test_capture_refuses_to_overwrite_good_snapshot_with_empty_one(self):
+        # Seed an existing, non-empty snapshot on disk.
+        good = {"version": 1, "saved_at": "T", "windows": [
+            {"order": 0, "class": "kitty", "workspace": 1, "monitor": 0,
+             "floating": False, "at": [0, 0], "size": [100, 100],
+             "fullscreen": 0, "cmd": ["kitty"]},
+        ]}
+        session.write_snapshot(good, self.path)
+
+        # The live client list is now empty (logout teardown).
+        hypr = ClientListHypr([])
+        snapshot = session.capture(hypr, [], self.proc, self.path)
+
+        # capture() still returns what it observed...
+        self.assertEqual(snapshot["windows"], [])
+        # ...but the good snapshot on disk must be untouched.
+        on_disk = session.read_snapshot(self.path)
+        self.assertEqual(on_disk, good)
+
+
+class CliTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.tmp.name)
+        self.env = {
+            "XDG_STATE_HOME": str(self.home / "state"),
+            "XDG_CONFIG_HOME": str(self.home / "config"),
+        }
+        self.saved = {k: os.environ.get(k) for k in self.env}
+        os.environ.update(self.env)
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_unknown_mode_returns_nonzero(self):
+        self.assertNotEqual(session.main(["nonsense"]), 0)
+
+    def test_no_mode_returns_nonzero(self):
+        self.assertNotEqual(session.main([]), 0)
+
+    def test_log_writes_to_state_directory(self):
+        session.log("hello from the test")
+        logfile = session.state_dir() / "session.log"
+        self.assertIn("hello from the test", logfile.read_text())
+
+    def test_log_never_raises_when_directory_is_unwritable(self):
+        os.environ["XDG_STATE_HOME"] = "/proc/cannot/write/here"
+        session.log("this must not raise")
+
+    def test_snapshot_path_lives_under_state_dir(self):
+        self.assertEqual(
+            session.snapshot_path(), session.state_dir() / "session.json"
+        )
+
+    def test_main_does_not_raise_when_event_socket_is_unavailable(self):
+        # main() must never raise, not even when run outside a live
+        # Hyprland session (missing HYPRLAND_INSTANCE_SIGNATURE /
+        # XDG_RUNTIME_DIR, so EventSocket() cannot be constructed). No
+        # snapshot exists on disk, which isolates the failure to
+        # EventSocket() construction rather than to restore().
+        saved_sig = os.environ.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+        saved_runtime = os.environ.pop("XDG_RUNTIME_DIR", None)
+        try:
+            self.assertEqual(session.main(["watch"]), 0)
+        finally:
+            if saved_sig is not None:
+                os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = saved_sig
+            if saved_runtime is not None:
+                os.environ["XDG_RUNTIME_DIR"] = saved_runtime
 
 
 if __name__ == "__main__":

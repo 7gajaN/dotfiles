@@ -5,6 +5,7 @@ Design: docs/superpowers/specs/2026-09-10-hypr-session-persistence-design.md
 Standard library only -- socat and jq are not installed on this machine.
 """
 
+import datetime
 import json
 import os
 import pathlib
@@ -13,6 +14,7 @@ import select
 import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -20,8 +22,18 @@ SCHEMA_VERSION = 1
 
 
 def log(message: str) -> None:
-    """Replaced by the file-backed logger in Task 8."""
-    print(message)
+    """Append one timestamped line to the log. Never raises.
+
+    Logging failures must not take down the watcher or block login.
+    """
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {message}\n"
+    try:
+        directory = state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(directory / "session.log", "a") as handle:
+            handle.write(line)
+    except OSError:
+        pass
 
 
 def state_dir() -> pathlib.Path:
@@ -488,3 +500,81 @@ def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
             except Exception as exc:
                 # A transient hyprctl or disk failure must not kill the watcher.
                 log(f"watch: snapshot failed: {exc}")
+
+
+def snapshot_path() -> pathlib.Path:
+    return state_dir() / "session.json"
+
+
+def capture(hypr, denylist: list, proc: pathlib.Path,
+            path: pathlib.Path) -> dict:
+    """Read the live client list, build a snapshot, and write it.
+
+    The write is guarded by should_write_snapshot(): at logout, Hyprland
+    closes every window before the event socket dies, so watch() can observe
+    a session in the act of disappearing. Writing that empty snapshot over a
+    good one would destroy it right when it is needed for the next login, so
+    a refused write is logged and skipped -- the snapshot actually observed
+    is still returned so callers can see what happened.
+    """
+    now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    snapshot = build_snapshot(hypr.clients(), denylist, proc, now)
+    if should_write_snapshot(snapshot, path):
+        write_snapshot(snapshot, path)
+    else:
+        log("capture: skipped write, new snapshot is empty but existing "
+            "snapshot is not (likely a logout in progress)")
+    return snapshot
+
+
+def main(argv: list) -> int:
+    if not argv:
+        print("usage: session.py {boot|watch|save|restore}", file=sys.stderr)
+        return 2
+    mode = argv[0]
+    if mode not in {"boot", "watch", "save", "restore"}:
+        print(f"unknown mode: {mode}", file=sys.stderr)
+        return 2
+
+    proc = pathlib.Path("/proc")
+    path = snapshot_path()
+    hypr = Hypr()
+    denylist = load_denylist(denylist_path())
+
+    if mode == "save":
+        snapshot = capture(hypr, denylist, proc, path)
+        log(f"save: wrote {len(snapshot['windows'])} window(s)")
+        return 0
+
+    try:
+        events = EventSocket()
+    except (KeyError, OSError) as exc:
+        # Missing HYPRLAND_INSTANCE_SIGNATURE/XDG_RUNTIME_DIR, or the socket
+        # itself refusing a connection, means there is no live compositor to
+        # talk to. main() must never raise -- not even here -- so this
+        # degrades to a logged no-op rather than blocking login.
+        log(f"{mode}: cannot connect to the event socket: {exc}")
+        return 0
+
+    if mode == "restore":
+        snapshot = read_snapshot(path)
+        if snapshot is None:
+            log("restore: no usable snapshot, nothing to do")
+            return 0
+        restore(snapshot, hypr, events)
+        return 0
+
+    if mode == "boot":
+        snapshot = read_snapshot(path)
+        if snapshot is None:
+            log("boot: no usable snapshot, going straight to watch")
+        else:
+            restore(snapshot, hypr, events)
+
+    log("watch: started")
+    watch(hypr, events, lambda: capture(hypr, denylist, proc, path))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
