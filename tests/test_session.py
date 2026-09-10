@@ -167,6 +167,11 @@ class FilteringTest(unittest.TestCase):
         patterns = session.load_denylist(self.path)
         self.assertEqual([p.pattern for p in patterns], ["^good$"])
 
+    def test_load_denylist_invalid_utf8_returns_empty(self):
+        self.path.write_bytes(b"^good$\n\xff\xfe not valid utf8\n")
+        patterns = session.load_denylist(self.path)
+        self.assertEqual(patterns, [])
+
     def test_denylisted_class_is_skipped(self):
         self.path.write_text("^steam$\n")
         deny = session.load_denylist(self.path)

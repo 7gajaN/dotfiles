@@ -132,7 +132,7 @@ def load_denylist(path: pathlib.Path) -> list:
     """Compile one regex per non-comment line. Invalid patterns are dropped."""
     try:
         lines = path.read_text().splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     patterns = []
     for line in lines:
