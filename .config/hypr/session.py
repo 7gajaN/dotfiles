@@ -341,15 +341,24 @@ def restore_command(window: dict, seen: dict) -> list:
     return argv
 
 
-def _await_window(events, cls: str, deadline: float, clock) -> str | None:
-    """Wait for an openwindow event whose class matches. Return its address."""
+def _await_window(events, cls: str, deadline: float, clock, consumed: set | None = None) -> str | None:
+    """Wait for an openwindow event whose class matches. Return its address.
+
+    Skips events whose address is already in the consumed set to avoid matching
+    stale events from previous timeouts to the current window launch.
+    """
+    if consumed is None:
+        consumed = set()
     while clock() < deadline:
         for name, payload in events.events(timeout=0.25):
             if name != "openwindow":
                 continue
             parts = payload.split(",", 3)
             if len(parts) >= 3 and parts[2] == cls:
-                return parts[0]
+                address = parts[0]
+                if address not in consumed:
+                    consumed.add(address)
+                    return address
     return None
 
 
@@ -364,41 +373,58 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     Returns the count of windows confirmed placed. Never raises -- a failure at
     any point degrades to a log line, because restore must not block login.
     """
-    windows = sorted(snapshot.get("windows", []), key=lambda w: w["order"])
+    windows = sorted(
+        snapshot.get("windows", []),
+        key=lambda w: w.get("order", float("inf"))
+    )
     started = clock()
     seen: dict = {}
     placed = 0
+    consumed: set = set()
+    had_timeout = False
 
     for window in windows:
         if clock() - started > total_timeout:
             log(f"restore: total timeout, abandoning {len(windows) - placed} window(s)")
             break
 
-        argv = restore_command(window, seen)
-        rules = f"workspace {window['workspace']} silent"
-        if not hypr.exec_with_rules(rules, argv):
-            log(f"restore: launch failed for {window['class']}")
+        try:
+            # Drain stale events from previous timeouts before launching.
+            if had_timeout:
+                while list(events.events(timeout=0)):
+                    pass
+                had_timeout = False
+
+            argv = restore_command(window, seen)
+            rules = f"workspace {window['workspace']} silent"
+            if not hypr.exec_with_rules(rules, argv):
+                log(f"restore: launch failed for {window['class']}")
+                continue
+
+            address = _await_window(
+                events, window["class"], clock() + per_window_timeout, clock, consumed
+            )
+            if not address:
+                log(f"restore: {window['class']} did not map in {per_window_timeout}s")
+                had_timeout = True
+                continue
+
+            if window.get("floating"):
+                x, y = window["at"]
+                w, h = window["size"]
+                hypr.dispatch(f"setfloating address:{address}")
+                hypr.dispatch(f"movewindowpixel exact {x} {y},address:{address}")
+                hypr.dispatch(f"resizewindowpixel exact {w} {h},address:{address}")
+
+            if window.get("fullscreen"):
+                hypr.dispatch(f"focuswindow address:{address}")
+                hypr.dispatch(f"fullscreen {window['fullscreen']}")
+
+            placed += 1
+
+        except (KeyError, TypeError, ValueError) as exc:
+            log(f"restore: skipping malformed entry {window}: {exc}")
             continue
-
-        address = _await_window(
-            events, window["class"], clock() + per_window_timeout, clock
-        )
-        if not address:
-            log(f"restore: {window['class']} did not map in {per_window_timeout}s")
-            continue
-
-        if window.get("floating"):
-            x, y = window["at"]
-            w, h = window["size"]
-            hypr.dispatch(f"setfloating address:{address}")
-            hypr.dispatch(f"movewindowpixel exact {x} {y},address:{address}")
-            hypr.dispatch(f"resizewindowpixel exact {w} {h},address:{address}")
-
-        if window.get("fullscreen"):
-            hypr.dispatch(f"focuswindow address:{address}")
-            hypr.dispatch(f"fullscreen {window['fullscreen']}")
-
-        placed += 1
 
     log(f"restore: placed {placed}/{len(windows)} window(s)")
     return placed

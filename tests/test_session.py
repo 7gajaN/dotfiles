@@ -467,6 +467,56 @@ class RestoreTest(unittest.TestCase):
             session.restore({"version": 1, "windows": []}, hypr, SilentEvents()), 0
         )
 
+    def test_missing_order_field_does_not_stop_restore(self):
+        hypr = FakeHypr()
+        events = FakeEvents([
+            ("openwindow", "0xb,2,kitty,t"),
+        ])
+        snap = {"version": 1, "windows": [
+            {"workspace": 1, "cmd": ["broken"]},  # missing "class" - will cause KeyError
+            window(1, "kitty", 2),  # valid window
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        # The broken entry should be skipped with an error, kitty should be launched
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
+
+    def test_floating_entry_missing_at_is_skipped(self):
+        hypr = FakeHypr()
+        events = FakeEvents([
+            ("openwindow", "0xa,1,broken,t"),
+            ("openwindow", "0xb,2,kitty,t"),
+        ])
+        snap = {"version": 1, "windows": [
+            {
+                "order": 0, "class": "broken", "workspace": 1, "cmd": ["broken"],
+                "floating": True, "size": [100, 100],  # missing "at"
+                "monitor": 0, "fullscreen": 0,
+            },
+            window(1, "kitty", 2),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["broken", "kitty"])
+
+    def test_stale_event_not_matched_to_next_window_same_class(self):
+        hypr = FakeHypr()
+        # Provide a stale event for the first window, then the correct event for the second.
+        # The consumed set ensures 0xa is not matched to window 2.
+        events = FakeEvents([
+            ("openwindow", "0xa,1,firefox,t"),  # event for window 1
+            ("openwindow", "0xb,2,firefox,t"),  # event for window 2
+        ])
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 1),
+            window(1, "firefox", 2, floating=True),  # window 2 is floating
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 2)
+        # Both windows should be placed. Window 2 is floating, so its address
+        # should appear in setfloating dispatch (should be 0xb, not 0xa).
+        self.assertIn("setfloating address:0xb", hypr.dispatches)
+
 
 if __name__ == "__main__":
     unittest.main()
