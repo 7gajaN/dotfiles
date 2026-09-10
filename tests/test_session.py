@@ -877,6 +877,20 @@ class CliTest(unittest.TestCase):
             if saved_runtime is not None:
                 os.environ["XDG_RUNTIME_DIR"] = saved_runtime
 
+    def test_main_save_does_not_raise_when_state_dir_is_unwritable(self):
+        # main() must never raise -- not even in save mode when the state
+        # directory cannot be created (e.g. /proc, which refuses mkdir).
+        # session.Hypr is swapped for FakeHypr for the duration of this call
+        # so the test never touches the live compositor via hyprctl; that
+        # substitution is undone in finally regardless of outcome.
+        os.environ["XDG_STATE_HOME"] = "/proc/cannot/write/here"
+        original_hypr = session.Hypr
+        session.Hypr = FakeHypr
+        try:
+            self.assertEqual(session.main(["save"]), 0)
+        finally:
+            session.Hypr = original_hypr
+
 
 if __name__ == "__main__":
     unittest.main()

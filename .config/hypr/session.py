@@ -516,11 +516,19 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     good one would destroy it right when it is needed for the next login, so
     a refused write is logged and skipped -- the snapshot actually observed
     is still returned so callers can see what happened.
+
+    The write itself is never allowed to propagate: write_snapshot() can
+    raise OSError (an unwritable or unreachable state directory, for
+    instance) and this must not take down a caller -- main()'s save mode
+    calls capture() directly, with no surrounding try/except of its own.
     """
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     snapshot = build_snapshot(hypr.clients(), denylist, proc, now)
     if should_write_snapshot(snapshot, path):
-        write_snapshot(snapshot, path)
+        try:
+            write_snapshot(snapshot, path)
+        except OSError as exc:
+            log(f"capture: failed to write snapshot: {exc}")
     else:
         log("capture: skipped write, new snapshot is empty but existing "
             "snapshot is not (likely a logout in progress)")
