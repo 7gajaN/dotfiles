@@ -86,6 +86,12 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("sleep 1 && awww img -o DP-2 $(find ~/.config/pics/wallpaper.png -type f | shuf -n 1)")
     hl.exec_cmd("sleep 1 && awww img -o DP-3 ~/.config/pics/takamura.jpg")
     hl.exec_cmd("waybar")
+    -- Restore the previous session's windows, then keep the snapshot current.
+    -- One process, not two: a separate watcher would observe the windows that
+    -- restore is creating and overwrite the good snapshot with a half-restored
+    -- one. The two-second delay lets the monitor and workspace rules settle
+    -- before any window is placed.
+    hl.exec_cmd("sleep 2 && python ~/.config/hypr/session.py boot")
 end)
 
 

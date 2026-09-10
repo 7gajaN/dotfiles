@@ -60,6 +60,47 @@ symlinked out of a user's home — see [`system/sddm/README.md`](system/sddm/REA
 - **PulseAudio/Pavucontrol**: sound system and volume control.
 - **GTK 3.0**: theme and appearance settings.
 
+## Session Persistence
+
+`.config/hypr/session.py` saves and restores window placement across reboots.
+Hyprland's `hyprland.start` hook runs it once in `boot` mode, which restores
+the previous session and then keeps watching for changes — one process, not
+two, so a separate watcher can never observe restore's own windows arriving
+and overwrite the snapshot it just wrote.
+
+State lives at `~/.local/state/hypr-session/session.json`, with a log
+(`session.log`) alongside it recording every save and restore. Windows whose
+class matches a pattern in `.config/hypr/session-denylist.txt` (one regex per
+line, matched against the window class) are never saved.
+
+Run it by hand with:
+
+```sh
+python ~/.config/hypr/session.py save     # snapshot the current windows
+python ~/.config/hypr/session.py restore  # relaunch the last snapshot
+```
+
+**Restored:** which applications are running, their workspace and monitor,
+floating versus tiled, a floating window's position and size, fullscreen
+state, and — for terminals — the working directory of the shell running
+inside them.
+
+**Not restored, and not restorable through Hyprland's IPC:** tiling split
+ratios (absent from `hyprctl -j clients`, and hy3 exposes no IPC command to
+read them — no tool can recover them), browser tabs, shell history,
+scrollback, and whatever programs happened to be running inside a terminal.
+For browser tabs, turn on Firefox's own "Open previous windows and tabs"
+setting instead.
+
+A snapshot is never overwritten with an empty one while a session is being
+torn down at logout, so logging out cannot destroy the saved session.
+
+Single-instance applications — ones that focus an existing window instead of
+opening a new one when launched again — need an entry in the `QUIRKS` table
+in `session.py`; `firefox` is already there.
+
+Tests: `python -m unittest discover -s tests`
+
 ## Fonts Used
 
 Only four fonts are actually referenced by the configs in this repo. Install
