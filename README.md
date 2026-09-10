@@ -89,14 +89,54 @@ duplicated set. It logs a warning when it starts with windows already open.
 **Restored:** which applications are running, their workspace and monitor,
 floating versus tiled, a floating window's position and size, true
 fullscreen state, and — for terminals — the working directory of the shell
-running inside them.
+running inside them, plus (see below) one allowlisted program if it was
+running in that shell.
 
 **Not restored, and not restorable through Hyprland's IPC:** tiling split
 ratios (absent from `hyprctl -j clients`, and hy3 exposes no IPC command to
-read them — no tool can recover them), browser tabs, shell history,
-scrollback, and whatever programs happened to be running inside a terminal.
-For browser tabs, turn on Firefox's own "Open previous windows and tabs"
-setting instead.
+read them — no tool can recover them), browser tabs, shell history, and
+scrollback. For browser tabs, turn on Firefox's own "Open previous windows
+and tabs" setting instead.
+
+### Restoring a program inside a terminal
+
+Whatever else happened to be running inside a terminal is not restored — with
+one narrow exception. `session.py` looks one level past the terminal's child
+shell: if a grandchild process's name is a key in the `ALLOWLIST` table, that
+name is saved as the window's `program` field, e.g.:
+
+```json
+{"class": "kitty", "cmd": ["kitty", "--directory", "/home/gion/coding/MS"], "program": "claude"}
+```
+
+At restore time, if `program` is present and still a key in `ALLOWLIST`, its
+fixed template is appended after `-e`:
+
+```
+kitty --directory /home/gion/coding/MS -e claude --continue
+```
+
+This is deliberately not "replay the recorded command line": the arguments a
+program was actually invoked with are read only to identify which program is
+running, then discarded. `ALLOWLIST` holds fixed templates, never recorded
+arguments — that table is the entire security boundary, since it is what
+runs unattended at every login. To allow another program, add it there:
+
+```python
+ALLOWLIST = {"claude": ["claude", "--continue"]}
+```
+
+An entry removed from `ALLOWLIST` makes every snapshot that still names it
+fall back silently to the plain terminal command — a stale `program` value
+can never launch anything.
+
+Two trade-offs are accepted as part of this design:
+
+- **Only one program per terminal, chosen from a fixed list.** Anything not
+  in `ALLOWLIST` is invisible to restore, and only the first allowlisted
+  match found among the shell's children is used.
+- **`-e` means quitting the program closes the window.** The window does not
+  drop back to a shell on exit, unlike a terminal opened normally.
 
 **Also not restored, deliberately:**
 

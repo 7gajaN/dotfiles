@@ -150,6 +150,15 @@ TERMINALS = {"kitty": "--directory"}
 
 SHELLS = frozenset({"zsh", "bash", "fish", "sh", "dash"})
 
+# The entire security boundary for restoring a program inside a terminal.
+# Keys are the only comm names ever recognised by child_program(); values are
+# the fixed argv template appended after `-e` at restore time. Recorded
+# arguments from the live process are read only to decide which key matched
+# -- they are never copied into the template. Add an entry here to allow a
+# new program to be restored; removing one makes every snapshot that still
+# names it fall back to the plain terminal command, silently.
+ALLOWLIST = {"claude": ["claude", "--continue"]}
+
 # Applications that focus an existing window instead of opening a new one.
 # The listed arguments are added at restore time, from the second window of
 # that class onward. Expect to add entries here as single-instance
@@ -213,6 +222,35 @@ def child_shell_cwd(pid: int, proc: pathlib.Path) -> str | None:
             except OSError:
                 return None
     return None
+
+
+def child_program(pid: int, proc: pathlib.Path) -> str | None:
+    """Return the allowlisted program running in the terminal's shell, or None.
+
+    One level deeper than child_shell_cwd: terminal -> child shell ->
+    grandchildren. Only a grandchild whose comm is a key in ALLOWLIST is ever
+    reported -- a name is read here only to check it against that table, and
+    the rest of the grandchild's cmdline is never looked at, so nothing
+    observed can travel any further than this one word.
+    """
+    for child in _children(pid, proc):
+        if _comm(child, proc) in SHELLS:
+            for grandchild in _children(child, proc):
+                name = _comm(grandchild, proc)
+                if name in ALLOWLIST:
+                    return name
+    return None
+
+
+def resolve_program(client: dict, proc: pathlib.Path) -> str | None:
+    """Return the allowlisted program running inside this window, or None.
+
+    Only window classes in TERMINALS are ever inspected -- a program running
+    inside, say, a browser is not something this tool can identify or trust.
+    """
+    if client.get("class") not in TERMINALS:
+        return None
+    return child_program(client["pid"], proc)
 
 
 def resolve_command(client: dict, proc: pathlib.Path) -> list[str]:
@@ -313,7 +351,7 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
 
     windows = []
     for order, (workspace, _index, client, command) in enumerate(ranked):
-        windows.append({
+        entry = {
             "order": order,
             "class": client["class"],
             "workspace": workspace,
@@ -323,7 +361,11 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
             "size": client.get("size", [0, 0]),
             "fullscreen": client.get("fullscreen", 0),
             "cmd": command,
-        })
+        }
+        program = resolve_program(client, proc)
+        if program:
+            entry["program"] = program
+        windows.append(entry)
 
     return {"version": SCHEMA_VERSION, "saved_at": now, "windows": windows}
 
@@ -450,11 +492,19 @@ class EventSocket:
 
 
 def restore_command(window: dict, seen: dict) -> list:
-    """Return the argv for this window, applying single-instance quirks.
+    """Return the argv for this window, applying single-instance quirks and
+    the program allowlist.
 
     The QUIRKS table lives beside strip_quirk_arguments() at the top of the
     file: these arguments are added here, at restore time, and stripped
     again at capture time so they cannot accumulate in the snapshot.
+
+    A saved "program" is only ever used as a lookup key into ALLOWLIST --
+    never as, or to build, anything that reaches argv directly. If the key
+    is missing, or names something no longer in ALLOWLIST (the table shrank
+    since this snapshot was written), nothing is appended and the window
+    restores exactly as it would with no program at all. That silent
+    fallback is deliberate: a stale program name must never run.
     """
     cls = window["class"]
     count = seen.get(cls, 0)
@@ -462,6 +512,10 @@ def restore_command(window: dict, seen: dict) -> list:
     argv = list(window["cmd"])
     if count and cls in QUIRKS:
         argv.extend(QUIRKS[cls])
+    template = ALLOWLIST.get(window.get("program"))
+    if template:
+        argv.append("-e")
+        argv.extend(template)
     return argv
 
 

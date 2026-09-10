@@ -226,6 +226,58 @@ class CommandResolutionTest(unittest.TestCase):
         self.assertEqual(session.resolve_command(client, self.proc), [])
 
 
+class ProgramDetectionTest(unittest.TestCase):
+    """child_program() looks one level past child_shell_cwd(): terminal ->
+    shell -> grandchildren. Only a grandchild whose comm is a key in
+    ALLOWLIST is ever reported, and only for TERMINALS classes -- this is
+    the entire security boundary for the allowlist feature, so each rule is
+    tested in isolation.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proc = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_allowlisted_grandchild_is_recorded(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["claude", "--continue"], "claude",
+                  "/home/u/project")
+        self.assertEqual(session.child_program(40, self.proc), "claude")
+
+    def test_non_allowlisted_grandchild_is_ignored(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["vim", "notes.txt"], "vim", "/home/u/project")
+        self.assertIsNone(session.child_program(40, self.proc))
+
+    def test_terminal_with_no_grandchildren_is_unaffected(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project")
+        self.assertIsNone(session.child_program(40, self.proc))
+
+    def test_terminal_with_no_children_at_all_is_unaffected(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u")
+        self.assertIsNone(session.child_program(40, self.proc))
+
+    def test_non_terminal_class_is_never_inspected_for_a_program(self):
+        fake_proc(self.proc, 40, ["firefox"], "firefox", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["claude"], "claude", "/home/u/project")
+        client = {"class": "firefox", "pid": 40}
+        self.assertIsNone(session.resolve_program(client, self.proc))
+
+    def test_terminal_class_is_inspected_via_resolve_program(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["claude"], "claude", "/home/u/project")
+        client = {"class": "kitty", "pid": 40}
+        self.assertEqual(session.resolve_program(client, self.proc), "claude")
+
+
 class FilteringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -404,6 +456,19 @@ class BuildSnapshotTest(unittest.TestCase):
         snap = session.build_snapshot(clients, [], self.proc, "T")
         self.assertEqual([w["class"] for w in snap["windows"]], ["kitty"])
         self.assertEqual([w["order"] for w in snap["windows"]], [0])
+
+    def test_allowlisted_grandchild_is_recorded_as_program(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u", children=[2])
+        fake_proc(self.proc, 2, ["-zsh"], "zsh", "/home/u", children=[3])
+        fake_proc(self.proc, 3, ["claude", "--continue"], "claude", "/home/u")
+        snap = session.build_snapshot([self.client("kitty", 1, 1)], [], self.proc, "T")
+        self.assertEqual(snap["windows"][0]["program"], "claude")
+
+    def test_no_program_key_when_nothing_allowlisted_is_running(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u", children=[2])
+        fake_proc(self.proc, 2, ["-zsh"], "zsh", "/home/u")
+        snap = session.build_snapshot([self.client("kitty", 1, 1)], [], self.proc, "T")
+        self.assertNotIn("program", snap["windows"][0])
 
 
 class EventParsingTest(unittest.TestCase):
@@ -659,6 +724,55 @@ class RestoreCommandTest(unittest.TestCase):
         session.restore_command(window(0, "kitty", 1), seen)
         self.assertEqual(
             session.restore_command(window(1, "kitty", 2), seen), ["kitty"]
+        )
+
+    def test_allowlisted_program_appends_dash_e_template(self):
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["cmd"] = ["kitty", "--directory", "/home/gion/coding/MS"]
+        w["program"] = "claude"
+        self.assertEqual(
+            session.restore_command(w, seen),
+            ["kitty", "--directory", "/home/gion/coding/MS", "-e",
+             "claude", "--continue"],
+        )
+
+    def test_missing_program_restores_exactly_as_before(self):
+        seen = {}
+        w = window(0, "kitty", 1)
+        self.assertNotIn("program", w)
+        self.assertEqual(session.restore_command(w, seen), ["kitty"])
+
+    def test_program_no_longer_in_allowlist_falls_back_silently(self):
+        # A stale snapshot from before an entry was removed from ALLOWLIST
+        # must never launch that program: the table is the whole security
+        # boundary, so anything not currently a key is treated as absent.
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["program"] = "some-removed-program"
+        self.assertEqual(session.restore_command(w, seen), ["kitty"])
+
+    def test_observed_arguments_never_leak_into_restored_argv(self):
+        # The recorded program name only ever identifies which fixed
+        # template to run; whatever arguments were actually observed on the
+        # grandchild's cmdline must never reach the launched argv.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = pathlib.Path(tmp)
+            fake_proc(proc, 1, ["kitty"], "kitty", "/home/u", children=[2])
+            fake_proc(proc, 2, ["-zsh"], "zsh", "/home/u", children=[3])
+            fake_proc(
+                proc, 3,
+                ["claude", "--dangerously-skip-permissions", "-p", "rm -rf /"],
+                "claude", "/home/u",
+            )
+            program = session.child_program(1, proc)
+            w = window(0, "kitty", 1)
+            w["cmd"] = ["kitty", "--directory", "/home/u"]
+            w["program"] = program
+            argv = session.restore_command(w, {})
+        self.assertEqual(
+            argv,
+            ["kitty", "--directory", "/home/u", "-e", "claude", "--continue"],
         )
 
 
