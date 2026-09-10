@@ -69,6 +69,13 @@ def read_snapshot(path: pathlib.Path) -> dict | None:
     """Return the snapshot, or None if it is missing, empty, or malformed.
 
     Never raises. Restore must degrade to a no-op rather than block login.
+
+    "Malformed" includes valid JSON that is not an object: `123`, `[1,2]` and
+    `true` all parse, and every caller then treats the result as a mapping.
+    Returning them would push an AttributeError into restore() and into
+    should_write_snapshot(), where it either kills boot before the watch loop
+    starts or fails every capture for the rest of the session. A snapshot is
+    an object or it is nothing.
     """
     try:
         text = path.read_text()
@@ -77,9 +84,12 @@ def read_snapshot(path: pathlib.Path) -> dict | None:
     if not text.strip():
         return None
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 # Window classes that are terminals, mapped to the flag that sets their
@@ -393,17 +403,48 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
 
     Returns the count of windows confirmed placed. Never raises -- a failure at
     any point degrades to a log line, because restore must not block login.
+    That contract covers a snapshot that is not shaped like a snapshot at all
+    (not an object, no window list, a window list holding non-objects) as well
+    as the event socket dying mid-restore.
+
+    No reconciliation against live windows is performed: every entry is
+    launched unconditionally. That is correct on the boot path, where the
+    compositor is empty, and it is the only path that matters. Run by hand
+    against a populated session it duplicates windows, so it warns below.
     """
+    if not isinstance(snapshot, dict):
+        log(f"restore: snapshot is not an object ({type(snapshot).__name__}), "
+            "nothing to do")
+        return 0
+    entries = snapshot.get("windows")
+    if not isinstance(entries, list):
+        log(f"restore: snapshot has no usable window list "
+            f"({type(entries).__name__}), nothing to do")
+        return 0
+
+    live = hypr.clients()
+    if live:
+        log(f"restore: WARNING {len(live)} window(s) are already open. restore "
+            "does not reconcile against live windows -- every saved window is "
+            "launched again, so these will be duplicated. restore is meant for "
+            "the boot path, where the compositor is empty.")
+
     windows = sorted(
-        snapshot.get("windows", []),
-        key=lambda w: w.get("order", float("inf"))
+        entries,
+        key=lambda w: w.get("order", float("inf")) if isinstance(w, dict)
+        else float("inf")
     )
     started = clock()
     seen: dict = {}
     placed = 0
+    # Belt and braces alongside the unconditional exhaustive drain below: the
+    # drain is what actually keeps stale events out of a launch's way, and no
+    # scenario is known in which this set is the only thing preventing a
+    # misattribution. It is kept because this is the code path that cost three
+    # rounds of fixes, and a second address-level guard costs nothing.
     consumed: set = set()
 
-    for window in windows:
+    for index, window in enumerate(windows):
         if clock() - started > total_timeout:
             log(f"restore: total timeout, abandoning {len(windows) - placed} window(s)")
             break
@@ -446,7 +487,19 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
 
             placed += 1
 
-        except (KeyError, TypeError, ValueError) as exc:
+        except ConnectionError as exc:
+            # The event socket died under us. Launching the rest blind would
+            # place windows nobody can confirm, so stop -- but stop by
+            # returning, never by raising: restore must not block login.
+            log(f"restore: event socket lost, abandoning "
+                f"{len(windows) - index} window(s): {exc}")
+            break
+
+        except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+            # AttributeError: an entry that is not a dict (a bare null in the
+            # window list) reaches .get()/[] here. OSError: select/recv on a
+            # dying socket raises plain OSError (EBADF), not just
+            # ConnectionError.
             log(f"restore: skipping malformed entry {window}: {exc}")
             continue
 
@@ -542,6 +595,21 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     return snapshot
 
 
+def _restore_safely(mode: str, snapshot: dict, hypr, events) -> None:
+    """Call restore() so that nothing it raises can escape.
+
+    restore() promises never to raise, and is written to keep that promise.
+    This is the belt for that braces: on the boot path an escaped exception
+    would skip the watch loop entirely, so no snapshot would be written for
+    the rest of the session and the next reboot would lose the real session
+    too. One bad snapshot file must never cost more than one restore.
+    """
+    try:
+        restore(snapshot, hypr, events)
+    except Exception as exc:
+        log(f"{mode}: restore failed, continuing: {exc!r}")
+
+
 def main(argv: list) -> int:
     if not argv:
         print("usage: session.py {boot|watch|save|restore}", file=sys.stderr)
@@ -576,7 +644,7 @@ def main(argv: list) -> int:
         if snapshot is None:
             log("restore: no usable snapshot, nothing to do")
             return 0
-        restore(snapshot, hypr, events)
+        _restore_safely(mode, snapshot, hypr, events)
         return 0
 
     if mode == "boot":
@@ -584,7 +652,7 @@ def main(argv: list) -> int:
         if snapshot is None:
             log("boot: no usable snapshot, going straight to watch")
         else:
-            restore(snapshot, hypr, events)
+            _restore_safely(mode, snapshot, hypr, events)
 
     log("watch: started")
     watch(hypr, events, lambda: capture(hypr, denylist, proc, path))

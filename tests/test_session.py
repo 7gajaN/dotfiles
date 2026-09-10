@@ -62,6 +62,17 @@ class SnapshotIOTest(unittest.TestCase):
         self.path.write_text("{not json")
         self.assertIsNone(session.read_snapshot(self.path))
 
+    def test_read_non_object_json_returns_none(self):
+        # Valid JSON that is not an object is still a malformed snapshot:
+        # every caller treats the result as a mapping, so returning one of
+        # these pushes an AttributeError into restore() (killing boot before
+        # the watch loop starts) and into should_write_snapshot() (failing
+        # every capture for the rest of the session).
+        for text in ("123", "[1, 2]", "true", "null", '"a string"'):
+            with self.subTest(text=text):
+                self.path.write_text(text)
+                self.assertIsNone(session.read_snapshot(self.path))
+
     def test_read_empty_returns_none(self):
         self.path.write_text("")
         self.assertIsNone(session.read_snapshot(self.path))
@@ -643,6 +654,84 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(events.buffer, [])
 
 
+class MalformedSnapshotRestoreTest(unittest.TestCase):
+    """restore() promises never to raise. A snapshot that is not shaped like
+    a snapshot must therefore be a logged no-op, not an AttributeError that
+    escapes boot and stops the watch loop from ever starting.
+    """
+
+    def test_non_object_snapshot_is_a_no_op(self):
+        for snapshot in (123, [1, 2], True, "abc", None):
+            with self.subTest(snapshot=snapshot):
+                hypr = FakeHypr()
+                self.assertEqual(
+                    session.restore(snapshot, hypr, SilentEvents()), 0
+                )
+                self.assertEqual(hypr.execs, [])
+
+    def test_non_list_window_collection_is_a_no_op(self):
+        for windows in ("abc", 7, {"a": 1}, None):
+            with self.subTest(windows=windows):
+                hypr = FakeHypr()
+                self.assertEqual(
+                    session.restore({"windows": windows}, hypr, SilentEvents()), 0
+                )
+                self.assertEqual(hypr.execs, [])
+
+    def test_non_object_entry_is_skipped_and_the_rest_still_restore(self):
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"]})
+        snap = {"version": 1, "windows": [None, window(1, "kitty", 2), 42]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
+
+    def test_event_socket_loss_mid_restore_does_not_raise(self):
+        class DyingEvents:
+            def events(self, timeout=None):
+                raise ConnectionError("event socket closed")
+                yield  # pragma: no cover - makes this a generator
+
+        hypr = FakeHypr()
+        snap = {"version": 1, "windows": [window(0, "a", 1), window(1, "b", 2)]}
+        # Must return, not raise: restore()'s contract, and boot must still
+        # reach the watch loop afterwards.
+        self.assertEqual(session.restore(snap, hypr, DyingEvents()), 0)
+
+
+class RestoreLiveWindowWarningTest(unittest.TestCase):
+    """restore() deliberately does not reconcile against live windows, so it
+    duplicates everything when run against a populated session. It must say
+    so in the log, because the README documents it as a hand-run command.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(pathlib.Path(self.tmp.name) / "state")
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = self.saved
+        self.tmp.cleanup()
+
+    def _log(self):
+        return (session.state_dir() / "session.log").read_text()
+
+    def test_warns_when_windows_are_already_open(self):
+        hypr = ClientListHypr([{"class": "kitty"}, {"class": "firefox"}])
+        session.restore({"version": 1, "windows": []}, hypr, SilentEvents())
+        text = self._log()
+        self.assertIn("restore: WARNING 2 window(s) are already open", text)
+        self.assertIn("duplicated", text)
+
+    def test_no_warning_on_an_empty_compositor(self):
+        session.restore({"version": 1, "windows": []}, FakeHypr(), SilentEvents())
+        self.assertNotIn("WARNING", self._log())
+
+
 class ExecWithRulesLuaEscapingTest(unittest.TestCase):
     """hyprctl on this machine parses its dispatch argument as Lua, not as a
     classic hyprlang dispatcher string (Hyprland 0.56.2, Lua config):
@@ -732,6 +821,19 @@ class ShouldWriteSnapshotTest(unittest.TestCase):
         self.path.write_bytes(b'\xff\xfe invalid json')
         new = {"version": 1, "windows": []}
         self.assertTrue(session.should_write_snapshot(new, self.path))
+
+    def test_non_object_existing_snapshot_does_not_raise(self):
+        # A file holding valid non-object JSON used to raise AttributeError
+        # here. Inside watch that is swallowed but fires on every capture,
+        # so one bad file permanently stopped the snapshot being updated.
+        for text in ("123", "[1, 2]", "true"):
+            with self.subTest(text=text):
+                self.path.write_text(text)
+                self.assertTrue(
+                    session.should_write_snapshot(
+                        {"version": 1, "windows": []}, self.path
+                    )
+                )
 
 
 class ScriptedEvents:
@@ -961,6 +1063,93 @@ class CliTest(unittest.TestCase):
                 os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = saved_sig
             if saved_runtime is not None:
                 os.environ["XDG_RUNTIME_DIR"] = saved_runtime
+
+    # -- boot mode -------------------------------------------------------
+    # boot is the only mode login actually uses, and it is the one place
+    # where a failure costs the whole session: an exception escaping restore
+    # means the watch loop never starts, so nothing is snapshotted for the
+    # rest of the session and the next reboot loses the real session too.
+
+    SNAPSHOT_WITH_ONE_KITTY = {
+        "version": 1, "saved_at": "T", "windows": [
+            {"order": 0, "class": "kitty", "workspace": 1, "monitor": 0,
+             "floating": False, "at": [0, 0], "size": [10, 10],
+             "fullscreen": 0, "cmd": ["kitty"]},
+        ],
+    }
+
+    def _run_boot(self, hypr=None, events=None):
+        """Run main(["boot"]) against fakes.
+
+        Returns (exit code, list of watch() calls). watch() is replaced so
+        the test does not enter an endless loop; reaching it at all is the
+        thing being asserted.
+        """
+        events = PersistentEventBuffer() if events is None else events
+        hypr = FakeHypr() if hypr is None else hypr
+        reached = []
+        original = (session.Hypr, session.EventSocket, session.watch)
+        session.Hypr = lambda: hypr
+        session.EventSocket = lambda: events
+        session.watch = lambda *args, **kwargs: reached.append((args, kwargs))
+        try:
+            code = session.main(["boot"])
+        finally:
+            session.Hypr, session.EventSocket, session.watch = original
+        return code, reached
+
+    def _write_snapshot_text(self, text):
+        path = session.snapshot_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_boot_restores_the_snapshot_then_enters_the_watch_loop(self):
+        session.write_snapshot(self.SNAPSHOT_WITH_ONE_KITTY,
+                               session.snapshot_path())
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"]})
+        code, reached = self._run_boot(hypr, events)
+        self.assertEqual(code, 0)
+        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
+        self.assertEqual(len(reached), 1, "boot must reach the watch loop")
+
+    def test_boot_reaches_watch_with_no_snapshot_at_all(self):
+        code, reached = self._run_boot()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reached), 1)
+
+    def test_boot_reaches_watch_when_the_snapshot_is_not_an_object(self):
+        # `123` parses as JSON but is not a snapshot. This used to end boot
+        # with an AttributeError traceback before the watch loop started.
+        self._write_snapshot_text("123")
+        code, reached = self._run_boot()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reached), 1)
+
+    def test_boot_reaches_watch_when_an_entry_is_not_an_object(self):
+        self._write_snapshot_text('{"version": 1, "windows": [null]}')
+        code, reached = self._run_boot()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reached), 1)
+
+    def test_boot_reaches_watch_even_if_restore_raises(self):
+        session.write_snapshot(self.SNAPSHOT_WITH_ONE_KITTY,
+                               session.snapshot_path())
+
+        def exploding(*args, **kwargs):
+            raise RuntimeError("restore exploded")
+
+        original_restore = session.restore
+        session.restore = exploding
+        try:
+            code, reached = self._run_boot()
+        finally:
+            session.restore = original_restore
+        self.assertEqual(code, 0)
+        self.assertEqual(len(reached), 1,
+                         "an exception from restore must not skip watch")
+        self.assertIn("restore failed",
+                      (session.state_dir() / "session.log").read_text())
 
     def test_main_save_does_not_raise_when_state_dir_is_unwritable(self):
         # main() must never raise -- not even in save mode when the state
