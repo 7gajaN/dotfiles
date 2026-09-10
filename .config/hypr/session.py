@@ -585,14 +585,48 @@ def should_write_snapshot(new_snapshot: dict, existing_path: pathlib.Path) -> bo
     return True
 
 
+def compositor_is_gone(events) -> bool:
+    """True when the event socket's path no longer exists.
+
+    Hyprland removes its runtime socket when it exits. If the path is gone
+    there is nothing to reconnect to and the process should end, which is
+    the "Hyprland exiting ends the process" half of the spec's rule. Fakes
+    without a path are never treated as gone.
+    """
+    path = getattr(events, "path", None)
+    if not path:
+        return False
+    return not os.path.exists(path)
+
+
 def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
-          clock=time.monotonic, stop=None) -> None:
+          clock=time.monotonic, stop=None, connect=None, sleep=time.sleep,
+          backoff_start: float = 1.0, backoff_max: float = 30.0,
+          max_attempts: int = 8) -> None:
     """Rewrite the snapshot whenever windows change, debounced.
 
     Dragging a window across workspaces emits a burst of events. Without
     debouncing, each one would trigger a full hyprctl call and file write.
+
+    Losing the socket is not the end of the loop. Per the spec's error
+    handling: reconnect with exponential backoff; Hyprland exiting ends the
+    process. `connect` is the callable that produces a fresh event source
+    (EventSocket on the real path); without one there is nothing to
+    reconnect to and the loop ends as it used to.
+
+    Both ConnectionError and plain OSError are treated as socket loss:
+    select() and recv() on a closed descriptor raise OSError (EBADF), which
+    previously escaped watch(), escaped main(), and killed the process with
+    no log line at all.
+
+    The retry budget is bounded (max_attempts consecutive failures, delays
+    doubling from backoff_start up to backoff_max) so a socket that refuses
+    every connection cannot spin forever. The budget resets after any read
+    that succeeds, so a session that loses the socket twice, hours apart,
+    gets a full budget each time.
     """
     pending_since = None
+    attempts = 0
 
     while True:
         if stop is not None and stop():
@@ -601,9 +635,33 @@ def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
             for name, _payload in events.events(timeout=0.25):
                 if name in WINDOW_EVENTS:
                     pending_since = clock()
-        except ConnectionError:
-            log("watch: event socket closed, exiting")
-            return
+            attempts = 0
+        except (ConnectionError, OSError) as exc:
+            try:
+                events.close()
+            except Exception:
+                pass
+            if compositor_is_gone(events):
+                log(f"watch: event socket is gone, Hyprland has exited: {exc}")
+                return
+            if connect is None:
+                log(f"watch: event socket closed and no reconnector, exiting: {exc}")
+                return
+            attempts += 1
+            if attempts > max_attempts:
+                log(f"watch: giving up after {max_attempts} reconnect attempts: {exc}")
+                return
+            delay = min(backoff_start * (2 ** (attempts - 1)), backoff_max)
+            log(f"watch: event socket lost ({exc}), reconnecting in {delay:g}s "
+                f"(attempt {attempts}/{max_attempts})")
+            sleep(delay)
+            try:
+                events = connect()
+            except (KeyError, OSError) as reconnect_exc:
+                log(f"watch: reconnect failed: {reconnect_exc}")
+                continue
+            log("watch: event socket reconnected")
+            continue
 
         if pending_since is not None and clock() - pending_since >= debounce:
             pending_since = None
@@ -733,7 +791,8 @@ def main(argv: list) -> int:
             _restore_safely(mode, snapshot, hypr, events)
 
     log("watch: started")
-    watch(hypr, events, lambda: capture(hypr, denylist, proc, path))
+    watch(hypr, events, lambda: capture(hypr, denylist, proc, path),
+          connect=EventSocket)
     return 0
 
 

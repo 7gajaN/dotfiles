@@ -848,6 +848,43 @@ class ScriptedEvents:
                 yield item
 
 
+class RaisingEvents:
+    """An event source whose every read fails, as a dead socket's does."""
+
+    def __init__(self, exc, path=None):
+        self.exc = exc
+        self.closed = 0
+        if path is not None:
+            self.path = path
+
+    def events(self, timeout=None):
+        raise self.exc
+        yield  # pragma: no cover - makes this a generator function
+
+    def close(self):
+        self.closed += 1
+
+
+class SequencedEvents:
+    """Each read yields the batch, or raises the exception, that stands in
+    its place in the script. Models a socket that fails, recovers, and
+    fails again."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.closed = 0
+
+    def events(self, timeout=None):
+        item = self.script.pop(0) if self.script else []
+        if isinstance(item, BaseException):
+            raise item
+        for event in item:
+            yield event
+
+    def close(self):
+        self.closed += 1
+
+
 class WatchTest(unittest.TestCase):
     def test_events_in_separate_reads_within_debounce_produce_one_snapshot(self):
         """Events in separate reads coalesce if clock advances < debounce between them."""
@@ -924,12 +961,26 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(writes, [])
 
     def test_snapshot_failure_does_not_end_the_loop(self):
-        """A transient hyprctl or disk failure must not kill the watcher."""
+        """A transient hyprctl or disk failure must not kill the watcher.
+
+        Not propagating is only half of it: the loop has to keep running and
+        keep taking snapshots afterwards, so this asserts that a second
+        attempt happens after the first one raises.
+        """
+        attempts = []
+
         def boom():
+            attempts.append(1)
             raise RuntimeError("hyprctl exploded")
 
-        events = ScriptedEvents([[("openwindow", "0xa,1,kitty,t")]])
-        ticks = iter([0.0, 0.0, 2.0, 2.0, 2.0])
+        events = ScriptedEvents([
+            [("openwindow", "0xa,1,kitty,t")],
+            [("closewindow", "0xa")],
+        ])
+        # iter1: event at 0.0, check at 2.0 -> first (failing) snapshot.
+        # iter2: event at 3.0, check at 5.0 -> second snapshot, proving the
+        #        loop survived the first failure and is still working.
+        ticks = iter([0.0, 2.0, 3.0, 5.0])
         calls = {"n": 0}
 
         def stop():
@@ -939,6 +990,160 @@ class WatchTest(unittest.TestCase):
         # Must return normally rather than propagate the exception.
         session.watch(FakeHypr(), events, boom, debounce=1.0,
                       clock=lambda: next(ticks), stop=stop)
+        self.assertEqual(len(attempts), 2)
+
+    def test_non_window_events_never_trigger_a_snapshot(self):
+        """activewindow and focusedmon fire on every focus change.
+
+        If they reached the debounce timer, merely moving the mouse between
+        monitors would cost a full `hyprctl clients` call and a disk write.
+        The clock advances 5s per reading, well past the 1s debounce, so a
+        single spurious pending_since would produce a write.
+        """
+        writes = []
+        events = ScriptedEvents([
+            [("activewindow", "kitty,a title"), ("focusedmon", "DP-2,1")],
+            [("activewindowv2", "0xa"), ("workspace", "3")],
+            [("createworkspace", "3"), ("urgent", "0xa")],
+            [],
+        ])
+        ticks = itertools.count(0.0, 5.0)
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 4
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        self.assertEqual(writes, [])
+
+    def test_each_window_event_triggers_a_snapshot(self):
+        """The behavioural counterpart: every name in WINDOW_EVENTS does
+        reach the debounce timer and produce exactly one write."""
+        for name in sorted(session.WINDOW_EVENTS):
+            with self.subTest(event=name):
+                writes = []
+                events = ScriptedEvents([[(name, "0xa,1,kitty,t")], []])
+                ticks = iter([0.0, 0.0, 2.0])
+                calls = {"n": 0}
+
+                def stop():
+                    calls["n"] += 1
+                    return calls["n"] > 2
+
+                session.watch(FakeHypr(), events, lambda: writes.append(1),
+                              debounce=1.0, clock=lambda: next(ticks),
+                              stop=stop)
+                self.assertEqual(len(writes), 1)
+
+
+class WatchReconnectTest(unittest.TestCase):
+    """The spec's error handling: "`watch` loses the socket: reconnect with
+    exponential backoff. Hyprland exiting ends the process." The
+    implementation used to log and return, ending snapshotting for the rest
+    of the session on any transient socket failure.
+    """
+
+    def test_socket_loss_reconnects_and_keeps_watching(self):
+        writes, sleeps, connects = [], [], []
+        dead = RaisingEvents(ConnectionError("event socket closed"))
+        fresh = ScriptedEvents([[("openwindow", "0xa,1,kitty,t")], []])
+
+        def connect():
+            connects.append(1)
+            return fresh
+
+        ticks = iter([0.0, 0.0, 2.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        session.watch(FakeHypr(), dead, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop,
+                      connect=connect, sleep=sleeps.append)
+        self.assertEqual(len(connects), 1)
+        self.assertEqual(sleeps, [1.0])
+        self.assertEqual(dead.closed, 1, "the dead socket must be closed")
+        # And the reconnected socket's events still drive snapshots.
+        self.assertEqual(len(writes), 1)
+
+    def test_plain_oserror_is_treated_as_socket_loss(self):
+        # select() and recv() on a closed descriptor raise OSError (EBADF),
+        # not ConnectionError. That used to escape watch(), escape main(),
+        # and kill the process with no log line.
+        sleeps, connects = [], []
+        dead = RaisingEvents(OSError(9, "Bad file descriptor"))
+
+        def connect():
+            connects.append(1)
+            return SilentEvents()
+
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        session.watch(FakeHypr(), dead, lambda: None, debounce=1.0,
+                      stop=stop, connect=connect, sleep=sleeps.append)
+        self.assertEqual(len(connects), 1)
+        self.assertEqual(sleeps, [1.0])
+
+    def test_backoff_is_exponential_capped_and_bounded(self):
+        # A socket that refuses every reconnection must not spin: the delays
+        # double up to the cap and the loop gives up after max_attempts.
+        # No stop() here on purpose -- terminating is what is under test.
+        sleeps, connects = [], []
+        dead = RaisingEvents(ConnectionError("gone"))
+
+        def connect():
+            connects.append(1)
+            raise OSError("connection refused")
+
+        session.watch(FakeHypr(), dead, lambda: None, debounce=1.0,
+                      connect=connect, sleep=sleeps.append,
+                      backoff_start=1.0, backoff_max=4.0, max_attempts=5)
+        self.assertEqual(sleeps, [1.0, 2.0, 4.0, 4.0, 4.0])
+        self.assertEqual(len(connects), 5)
+
+    def test_a_vanished_socket_path_ends_the_process(self):
+        # Hyprland removes its runtime socket when it exits. Nothing to
+        # reconnect to, so the watcher stops rather than burning its budget.
+        connects = []
+        dead = RaisingEvents(ConnectionError("closed"),
+                             path="/nonexistent/hypr/none/.socket2.sock")
+        session.watch(FakeHypr(), dead, lambda: None, debounce=1.0,
+                      connect=lambda: connects.append(1), sleep=lambda d: None)
+        self.assertEqual(connects, [])
+        self.assertEqual(dead.closed, 1)
+
+    def test_without_a_reconnector_the_loop_still_ends_cleanly(self):
+        dead = RaisingEvents(ConnectionError("closed"))
+        session.watch(FakeHypr(), dead, lambda: None, debounce=1.0)
+
+    def test_a_successful_read_resets_the_retry_budget(self):
+        # Two separate outages must each get the full budget, rather than
+        # the second one inheriting the first one's spent attempts.
+        sleeps = []
+        source = SequencedEvents([
+            ConnectionError("first outage"),
+            [],                              # one clean read
+            ConnectionError("second outage"),
+            [],
+        ])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 4
+
+        session.watch(FakeHypr(), source, lambda: None, debounce=1.0,
+                      stop=stop, connect=lambda: source, sleep=sleeps.append)
+        # Both outages waited backoff_start, not backoff_start then double.
+        self.assertEqual(sleeps, [1.0, 1.0])
 
 
 class ClientListHypr(FakeHypr):
