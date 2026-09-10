@@ -272,7 +272,7 @@ class Hypr:
             log("hyprctl clients returned invalid JSON")
             return []
 
-    def _hyprctl(self, args: list, label: str) -> bool:
+    def _hyprctl(self, args: list) -> bool:
         try:
             subprocess.run(
                 ["hyprctl", *args],
@@ -280,25 +280,34 @@ class Hypr:
             )
             return True
         except (subprocess.SubprocessError, OSError) as exc:
-            log(f"hyprctl failed [{label}]: {exc}")
+            log(f"hyprctl failed [{' '.join(args)}]: {exc}")
             return False
 
-    def dispatch(self, args: str) -> bool:
-        return self._hyprctl(["dispatch", *shlex.split(args)], args)
+    @staticmethod
+    def _lua_quote(text: str) -> str:
+        """Escape text for embedding inside a Lua double-quoted string literal."""
+        return text.replace("\\", "\\\\").replace('"', '\\"')
 
     def exec_with_rules(self, rules: str, argv: list) -> bool:
-        """Run 'hyprctl dispatch exec [rules] cmd'.
+        """Run 'hyprctl dispatch exec [rules] cmd' via the Lua dispatcher.
+
+        On this machine Hyprland 0.56.2 runs a Lua config, and hyprctl parses
+        its dispatch argument as Lua (`return hl.dispatch(<arg>)`), not as a
+        classic hyprlang dispatcher string -- verified against the live
+        compositor: `hyprctl dispatch exec true` raises a Lua syntax error.
+        The working form, also verified live, is
+        `hl.dsp.exec_cmd("[rules] command")` passed to `hyprctl dispatch` as
+        a single argument. The rule-prefixed command therefore has to be
+        embedded inside a Lua double-quoted string literal, hence the
+        escaping below (at minimum backslashes and double quotes).
 
         The rule prefix is applied when the window maps, so the window never
-        appears on the wrong workspace first. Verified supported in 0.56.2.
-
-        This deliberately does NOT go through dispatch(): shlex.split would
-        shatter '[workspace 1 silent]' into four argv elements. The whole
-        prefixed command must reach hyprctl as one argument.
+        appears on the wrong workspace first.
         """
         command = " ".join(shlex.quote(part) for part in argv)
         payload = f"[{rules}] {command}"
-        return self._hyprctl(["dispatch", "exec", payload], payload)
+        lua_expr = f'hl.dsp.exec_cmd("{self._lua_quote(payload)}")'
+        return self._hyprctl(["dispatch", lua_expr])
 
 
 class EventSocket:
@@ -414,7 +423,16 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
                 pass
 
             argv = restore_command(window, seen)
-            rules = f"workspace {window['workspace']} silent"
+            rule_parts = [f"workspace {window['workspace']} silent"]
+            if window.get("floating"):
+                x, y = window["at"]
+                w, h = window["size"]
+                rule_parts.append("float")
+                rule_parts.append(f"move {x} {y}")
+                rule_parts.append(f"size {w} {h}")
+            if window.get("fullscreen"):
+                rule_parts.append("fullscreen")
+            rules = "; ".join(rule_parts)
             if not hypr.exec_with_rules(rules, argv):
                 log(f"restore: launch failed for {window['class']}")
                 continue
@@ -425,17 +443,6 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             if not address:
                 log(f"restore: {window['class']} did not map in {per_window_timeout}s")
                 continue
-
-            if window.get("floating"):
-                x, y = window["at"]
-                w, h = window["size"]
-                hypr.dispatch(f"setfloating address:{address}")
-                hypr.dispatch(f"movewindowpixel exact {x} {y},address:{address}")
-                hypr.dispatch(f"resizewindowpixel exact {w} {h},address:{address}")
-
-            if window.get("fullscreen"):
-                hypr.dispatch(f"focuswindow address:{address}")
-                hypr.dispatch(f"fullscreen {window['fullscreen']}")
 
             placed += 1
 

@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SESSION_PY = REPO / ".config" / "hypr" / "session.py"
@@ -330,14 +331,9 @@ class EventParsingTest(unittest.TestCase):
 class FakeHypr:
     def __init__(self):
         self.execs = []
-        self.dispatches = []
 
     def exec_with_rules(self, rules, argv):
         self.execs.append((rules, argv))
-        return True
-
-    def dispatch(self, args):
-        self.dispatches.append(args)
         return True
 
     def clients(self):
@@ -475,31 +471,38 @@ class RestoreTest(unittest.TestCase):
         session.restore(snap, hypr, events)
         self.assertEqual([argv[0] for _rules, argv in hypr.execs], ["kitty", "mpv"])
 
-    def test_floating_window_gets_geometry_dispatches(self):
+    def test_floating_window_gets_geometry_in_rules(self):
+        # Geometry no longer travels as post-hoc dispatch calls (those never
+        # worked on this machine's Lua-config hyprctl -- see Hypr.dispatch's
+        # removal). It now rides in the exec rule prefix instead, so this
+        # asserts on hypr.execs rather than a (now-gone) hypr.dispatches.
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
         snap = {"version": 1, "windows": [
             window(0, "mpv", 1, floating=True, at=(5, 6), size=(640, 480)),
         ]}
         session.restore(snap, hypr, events)
-        self.assertIn("setfloating address:0xa", hypr.dispatches)
-        self.assertIn("movewindowpixel exact 5 6,address:0xa", hypr.dispatches)
-        self.assertIn("resizewindowpixel exact 640 480,address:0xa", hypr.dispatches)
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent; float; move 5 6; size 640 480", ["mpv"])],
+        )
 
-    def test_tiled_window_gets_no_geometry_dispatches(self):
+    def test_tiled_window_gets_no_geometry_rules(self):
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"kitty": ["0xa"]})
         snap = {"version": 1, "windows": [window(0, "kitty", 1)]}
         session.restore(snap, hypr, events)
-        self.assertEqual(hypr.dispatches, [])
+        self.assertEqual(hypr.execs, [("workspace 1 silent", ["kitty"])])
 
-    def test_fullscreen_window_is_refocused_and_fullscreened(self):
+    def test_fullscreen_window_gets_fullscreen_rule(self):
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
         snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=1)]}
         session.restore(snap, hypr, events)
-        self.assertIn("focuswindow address:0xa", hypr.dispatches)
-        self.assertIn("fullscreen 1", hypr.dispatches)
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent; fullscreen", ["mpv"])],
+        )
 
     def test_failed_launch_does_not_stop_the_next_window(self):
         hypr = FailingHypr()
@@ -553,9 +556,13 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
 
     def test_floating_entry_missing_at_is_skipped(self):
-        # The entry maps successfully (so we reach the geometry code), but is
-        # missing "at" -- the per-window try/except must catch the resulting
-        # KeyError and skip it rather than raising out of restore().
+        # Missing "at" now raises KeyError while building the rule string,
+        # before the launch -- geometry rides in the exec rule prefix now,
+        # built from window["at"]/["size"] ahead of the single
+        # exec_with_rules call, rather than in post-hoc calls made after the
+        # window has already mapped. The per-window try/except must still
+        # catch it and skip the entry rather than raising out of restore(),
+        # it just does so earlier: hypr.execs never even sees "broken".
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"broken": ["0xc"]})
         snap = {"version": 1, "windows": [
@@ -566,9 +573,8 @@ class RestoreTest(unittest.TestCase):
             },
         ]}
         placed = session.restore(snap, hypr, events)
-        # Malformed entry attempt is made, but skipped with error, no windows placed
         self.assertEqual(placed, 0)
-        self.assertEqual([argv[0] for _r, argv in hypr.execs], ["broken"])
+        self.assertEqual(hypr.execs, [])
 
     def test_stale_event_is_not_misattributed_to_first_window(self):
         # A stale same-class event, pending before restore() ever runs, must
@@ -591,8 +597,21 @@ class RestoreTest(unittest.TestCase):
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
-        self.assertIn("setfloating address:0xreal", hypr.dispatches)
-        self.assertNotIn("setfloating address:0xstale", hypr.dispatches)
+        # Geometry (proof the right window was configured at all) now rides
+        # in the exec rule prefix -- it carries no address, since the rules
+        # apply to whichever window this exec call maps, not to an address
+        # dispatched at afterward. So it can't by itself prove _await_window
+        # picked "0xreal" over the stale "0xstale". What can: "0xreal" is
+        # only enqueued once exec_with_rules launches the window, so it is
+        # unreachable at drain time. If drain failed to clear "0xstale" first,
+        # _await_window's FIFO scan would return "0xstale" instead, leaving
+        # "0xreal" stranded, unconsumed, in the buffer -- so an empty buffer
+        # at the end is proof "0xreal", not the stale event, was matched.
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent; float; move 5 6; size 640 480", ["kitty"])],
+        )
+        self.assertEqual(events.buffer, [])
 
     def test_drain_clears_a_multi_event_backlog(self):
         # PersistentEventBuffer.events() yields only one item per call, the
@@ -612,9 +631,75 @@ class RestoreTest(unittest.TestCase):
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
-        self.assertIn("setfloating address:0xreal", hypr.dispatches)
-        self.assertNotIn("setfloating address:0xstale1", hypr.dispatches)
-        self.assertNotIn("setfloating address:0xstale2", hypr.dispatches)
+        # See test_stale_event_is_not_misattributed_to_first_window for why
+        # an empty buffer, rather than a dispatched address, is the proof
+        # here: "0xreal" is only reachable once both stale events are
+        # drained out of the way, so it being consumed means the drain
+        # cleared the whole two-event backlog, not just the first one.
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent; float; move 5 6; size 640 480", ["kitty"])],
+        )
+        self.assertEqual(events.buffer, [])
+
+
+class ExecWithRulesLuaEscapingTest(unittest.TestCase):
+    """hyprctl on this machine parses its dispatch argument as Lua, not as a
+    classic hyprlang dispatcher string (Hyprland 0.56.2, Lua config):
+    `hyprctl dispatch exec true` raises a Lua syntax error. The working
+    form, verified against the live compositor, is
+    `hl.dsp.exec_cmd("[rules] command")` passed to `hyprctl dispatch` as one
+    argument -- so the whole rule-prefixed command must be embedded inside a
+    Lua double-quoted string literal. These tests prove that embedding is
+    done safely for commands real windows actually produce: a terminal
+    relaunch with a space-bearing --directory path, and any command whose
+    text contains a literal double quote (which would otherwise terminate
+    the Lua string early and reproduce exactly the defect being fixed).
+    """
+
+    def _dispatched_lua_expr(self, rules, argv):
+        hypr = session.Hypr()
+        with mock.patch.object(session.subprocess, "run") as run:
+            run.return_value = mock.Mock()
+            ok = hypr.exec_with_rules(rules, argv)
+        self.assertTrue(ok)
+        args = run.call_args.args[0]
+        self.assertEqual(args[0], "hyprctl")
+        self.assertEqual(args[1], "dispatch")
+        self.assertEqual(len(args), 3)
+        return args[2]
+
+    def test_space_bearing_path_survives_intact(self):
+        lua_expr = self._dispatched_lua_expr(
+            "workspace 3 silent",
+            ["kitty", "--directory", "/home/user/My Projects"],
+        )
+        self.assertEqual(
+            lua_expr,
+            'hl.dsp.exec_cmd("[workspace 3 silent] kitty --directory '
+            '\'/home/user/My Projects\'")',
+        )
+
+    def test_double_quote_in_command_is_escaped_for_lua(self):
+        lua_expr = self._dispatched_lua_expr(
+            "workspace 1 silent",
+            ["kitty", "--title", 'Session "Test"'],
+        )
+        # shlex.quote wraps the unsafe argument in single quotes but leaves
+        # the double quotes inside it literal; the Lua layer must then
+        # escape those or the generated Lua string literal would terminate
+        # early at the first one, exactly like the original defect.
+        self.assertEqual(
+            lua_expr,
+            'hl.dsp.exec_cmd("[workspace 1 silent] kitty --title '
+            '\'Session \\"Test\\"\'")',
+        )
+
+    def test_lua_quote_escapes_backslashes_and_double_quotes(self):
+        raw = 'a "quoted" \\ path'
+        self.assertEqual(
+            session.Hypr._lua_quote(raw), 'a \\"quoted\\" \\\\ path'
+        )
 
 
 class ShouldWriteSnapshotTest(unittest.TestCase):
