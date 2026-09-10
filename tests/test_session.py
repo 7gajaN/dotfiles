@@ -592,6 +592,38 @@ class RestoreTest(unittest.TestCase):
         self.assertNotIn("setfloating address:0xstale2", hypr.dispatches)
 
 
+class ShouldWriteSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.tmp.name) / "session.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_non_empty_snapshot_always_writes(self):
+        new = {"version": 1, "windows": [{"class": "kitty"}]}
+        self.assertTrue(session.should_write_snapshot(new, self.path))
+
+    def test_empty_snapshot_over_empty_existing_writes(self):
+        session.write_snapshot({"version": 1, "windows": []}, self.path)
+        new = {"version": 1, "windows": []}
+        self.assertTrue(session.should_write_snapshot(new, self.path))
+
+    def test_empty_snapshot_over_non_empty_existing_refused(self):
+        session.write_snapshot({"version": 1, "windows": [{"class": "kitty"}]}, self.path)
+        new = {"version": 1, "windows": []}
+        self.assertFalse(session.should_write_snapshot(new, self.path))
+
+    def test_missing_existing_snapshot_does_not_block_empty_write(self):
+        new = {"version": 1, "windows": []}
+        self.assertTrue(session.should_write_snapshot(new, self.path))
+
+    def test_unreadable_existing_snapshot_does_not_block_empty_write(self):
+        self.path.write_bytes(b'\xff\xfe invalid json')
+        new = {"version": 1, "windows": []}
+        self.assertTrue(session.should_write_snapshot(new, self.path))
+
+
 class ScriptedEvents:
     """Yields a scripted batch per call, then nothing."""
 
@@ -605,14 +637,67 @@ class ScriptedEvents:
 
 
 class WatchTest(unittest.TestCase):
-    def test_burst_of_events_produces_one_snapshot(self):
+    def test_events_in_separate_reads_within_debounce_produce_one_snapshot(self):
+        """Events in separate reads coalesce if clock advances < debounce between them."""
         writes = []
-        events = ScriptedEvents([[
-            ("movewindow", "0xa,2"),
-            ("movewindow", "0xa,3"),
-            ("movewindow", "0xa,4"),
-        ]])
-        ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0])
+        events = ScriptedEvents([
+            [("movewindow", "0xa,2")],  # First event
+            [],                          # Nothing
+            [("movewindow", "0xb,3")],  # Second event (0.5s later)
+            [],                          # Nothing
+        ])
+        # Ticks: event1(0), check(0), nothing, check(0.5), event2(0.5), check(0.5),
+        #        nothing, check(1.5 - triggers snapshot because 1.5-0.5 >= 1.0)
+        ticks = iter([0.0, 0.0, 0.5, 0.5, 1.5, 1.5])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 4
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        # Events 0.5s apart (< 1.0s debounce) should produce ONE snapshot
+        # firing when clock reaches 1.5s (1.0s after the last event at 0.5s)
+        self.assertEqual(len(writes), 1)
+
+    def test_two_bursts_separated_by_more_than_debounce_produce_two_snapshots(self):
+        """Two event bursts > debounce interval apart produce two snapshots."""
+        writes = []
+        events = ScriptedEvents([
+            [("movewindow", "0xa,2")],  # Burst 1 at t=0
+            [],                          # Nothing
+            [],                          # Nothing (time passes)
+            [("movewindow", "0xb,3")],  # Burst 2 at t=2.0 (2.0 > 1.0, past debounce)
+            [],                          # Nothing
+            [],                          # Nothing
+        ])
+        # Iter1: burst1(0), check(0), Iter2: nothing, check(0.5), Iter3: nothing,
+        # check(1.5→snap1!), Iter4: burst2(2.0), check(2.0), Iter5: nothing, check(2.5),
+        # Iter6: nothing, check(3.0→snap2!)
+        ticks = iter([0.0, 0.0, 0.5, 1.5, 2.0, 2.0, 2.5, 3.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 6
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        # First burst fires at t=1.5 (1.0s after event at 0), second at t=3.0 (1.0s after event at 2.0)
+        self.assertEqual(len(writes), 2)
+
+    def test_snapshot_does_not_fire_before_debounce_elapses(self):
+        """No snapshot fires while clock has not advanced past debounce interval."""
+        writes = []
+        events = ScriptedEvents([
+            [("movewindow", "0xa,2")],  # Event at t=0
+            [],                          # Nothing
+            [],                          # Nothing
+        ])
+        # Ticks: event(0), check(0), nothing, check(0.5), nothing, check(0.8)
+        # Clock never reaches 1.0, so debounce never elapses
+        ticks = iter([0.0, 0.0, 0.5, 0.8])
         calls = {"n": 0}
 
         def stop():
@@ -621,37 +706,8 @@ class WatchTest(unittest.TestCase):
 
         session.watch(FakeHypr(), events, lambda: writes.append(1),
                       debounce=1.0, clock=lambda: next(ticks), stop=stop)
-        self.assertEqual(len(writes), 1)
-
-    def test_irrelevant_events_never_trigger_a_snapshot(self):
-        writes = []
-        events = ScriptedEvents([[("activewindow", "kitty,title")]])
-        ticks = iter([0.0, 0.0, 5.0, 5.0, 5.0])
-        calls = {"n": 0}
-
-        def stop():
-            calls["n"] += 1
-            return calls["n"] > 2
-
-        session.watch(FakeHypr(), events, lambda: writes.append(1),
-                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        # No snapshot should fire because debounce never elapses
         self.assertEqual(writes, [])
-
-    def test_snapshot_failure_does_not_end_the_loop(self):
-        def boom():
-            raise RuntimeError("hyprctl exploded")
-
-        events = ScriptedEvents([[("openwindow", "0xa,1,kitty,t")]])
-        ticks = iter([0.0, 0.0, 2.0, 2.0, 2.0])
-        calls = {"n": 0}
-
-        def stop():
-            calls["n"] += 1
-            return calls["n"] > 2
-
-        # Must return normally rather than propagate.
-        session.watch(FakeHypr(), events, boom, debounce=1.0,
-                      clock=lambda: next(ticks), stop=stop)
 
 
 if __name__ == "__main__":

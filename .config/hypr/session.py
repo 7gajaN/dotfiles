@@ -435,6 +435,32 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     return placed
 
 
+def should_write_snapshot(new_snapshot: dict, existing_path: pathlib.Path) -> bool:
+    """Refuse to overwrite a non-empty snapshot with an empty one.
+
+    At logout, Hyprland closes every window, emitting closewindow events
+    BEFORE the event socket dies. With a 1s debounce, watch may observe the
+    teardown and write a snapshot of vanishing windows, destroying the good
+    snapshot at exactly the moment it is needed for the next login.
+
+    This guard protects the saved session: if the newly built snapshot has
+    zero windows and an existing snapshot on disk has windows, skip the write.
+    A missing or unreadable existing snapshot never blocks the write.
+    """
+    new_window_count = len(new_snapshot.get("windows", []))
+    if new_window_count > 0:
+        return True
+    # New snapshot is empty. Check what's on disk.
+    existing = read_snapshot(existing_path)
+    if existing is None:
+        return True
+    existing_window_count = len(existing.get("windows", []))
+    if existing_window_count > 0:
+        # Existing snapshot has windows; refuse to overwrite with empty.
+        return False
+    return True
+
+
 def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
           clock=time.monotonic, stop=None) -> None:
     """Rewrite the snapshot whenever windows change, debounced.
