@@ -273,5 +273,34 @@ class BuildSnapshotTest(unittest.TestCase):
         self.assertEqual([w["order"] for w in snap["windows"]], [0])
 
 
+class EventParsingTest(unittest.TestCase):
+    def test_parses_event_and_payload(self):
+        self.assertEqual(
+            session.parse_event("openwindow>>0xabc,1,kitty,a title"),
+            ("openwindow", "0xabc,1,kitty,a title"),
+        )
+
+    def test_payload_may_contain_the_separator(self):
+        self.assertEqual(
+            session.parse_event("activewindow>>firefox,a>>b"),
+            ("activewindow", "firefox,a>>b"),
+        )
+
+    def test_empty_payload(self):
+        self.assertEqual(session.parse_event("closewindow>>"), ("closewindow", ""))
+
+    def test_malformed_line_returns_none(self):
+        self.assertIsNone(session.parse_event("garbage without separator"))
+
+    def test_blank_line_returns_none(self):
+        self.assertIsNone(session.parse_event(""))
+
+    def test_window_events_set_contents(self):
+        self.assertEqual(
+            session.WINDOW_EVENTS,
+            frozenset({"openwindow", "closewindow", "movewindow", "movewindowv2"}),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

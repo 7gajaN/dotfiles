@@ -9,6 +9,10 @@ import json
 import os
 import pathlib
 import re
+import select
+import shlex
+import socket
+import subprocess
 import tempfile
 
 SCHEMA_VERSION = 1
@@ -217,3 +221,103 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
         })
 
     return {"version": SCHEMA_VERSION, "saved_at": now, "windows": windows}
+
+
+# Verified present in the Hyprland 0.56.2 binary.
+WINDOW_EVENTS = frozenset({"openwindow", "closewindow", "movewindow", "movewindowv2"})
+
+
+def parse_event(line: str) -> tuple | None:
+    """Split a socket2 line of the form 'eventname>>payload'."""
+    if ">>" not in line:
+        return None
+    name, _, payload = line.partition(">>")
+    if not name:
+        return None
+    return name, payload
+
+
+class Hypr:
+    """Every call into the compositor goes through here.
+
+    Kept deliberately thin: restore and watch are tested against fakes that
+    implement this same interface, so any logic added here escapes testing.
+    """
+
+    def clients(self) -> list:
+        try:
+            out = subprocess.run(
+                ["hyprctl", "-j", "clients"],
+                capture_output=True, text=True, timeout=10, check=True,
+            ).stdout
+        except (subprocess.SubprocessError, OSError) as exc:
+            log(f"hyprctl clients failed: {exc}")
+            return []
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            log("hyprctl clients returned invalid JSON")
+            return []
+
+    def _hyprctl(self, args: list, label: str) -> bool:
+        try:
+            subprocess.run(
+                ["hyprctl", *args],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+            return True
+        except (subprocess.SubprocessError, OSError) as exc:
+            log(f"hyprctl failed [{label}]: {exc}")
+            return False
+
+    def dispatch(self, args: str) -> bool:
+        return self._hyprctl(["dispatch", *shlex.split(args)], args)
+
+    def exec_with_rules(self, rules: str, argv: list) -> bool:
+        """Run 'hyprctl dispatch exec [rules] cmd'.
+
+        The rule prefix is applied when the window maps, so the window never
+        appears on the wrong workspace first. Verified supported in 0.56.2.
+
+        This deliberately does NOT go through dispatch(): shlex.split would
+        shatter '[workspace 1 silent]' into four argv elements. The whole
+        prefixed command must reach hyprctl as one argument.
+        """
+        command = " ".join(shlex.quote(part) for part in argv)
+        payload = f"[{rules}] {command}"
+        return self._hyprctl(["dispatch", "exec", payload], payload)
+
+
+class EventSocket:
+    """Reader for Hyprland's .socket2.sock event stream."""
+
+    def __init__(self, path: str | None = None):
+        if path is None:
+            runtime = os.environ["XDG_RUNTIME_DIR"]
+            signature = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
+            path = f"{runtime}/hypr/{signature}/.socket2.sock"
+        self.path = path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self.path)
+        self.buffer = ""
+
+    def events(self, timeout: float | None = None):
+        """Yield (name, payload) pairs. Returns when timeout elapses."""
+        ready, _, _ = select.select([self.sock], [], [], timeout)
+        if not ready:
+            return
+        chunk = self.sock.recv(8192)
+        if not chunk:
+            raise ConnectionError("event socket closed")
+        self.buffer += chunk.decode(errors="replace")
+        while "\n" in self.buffer:
+            line, _, self.buffer = self.buffer.partition("\n")
+            parsed = parse_event(line.strip())
+            if parsed:
+                yield parsed
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
