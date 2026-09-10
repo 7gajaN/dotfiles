@@ -341,6 +341,23 @@ class SilentEvents:
         return iter(())
 
 
+class PersistentEventBuffer:
+    """Event buffer that persists across multiple events() calls.
+
+    Models real event arrival: events enqueued before restore() starts are still
+    in the buffer when windows are launched. This allows testing the scenario where
+    a stale same-class event is sitting in the queue before a window launches.
+    """
+
+    def __init__(self, initial_events):
+        self.buffer = list(initial_events)
+
+    def events(self, timeout=None):
+        """Yield one event if available from the persistent buffer."""
+        if self.buffer:
+            yield self.buffer.pop(0)
+
+
 def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0):
     return {
         "order": order, "class": cls, "workspace": ws, "monitor": 0,
@@ -375,6 +392,7 @@ class RestoreCommandTest(unittest.TestCase):
 class RestoreTest(unittest.TestCase):
     def test_places_each_window_on_its_workspace(self):
         hypr = FakeHypr()
+        # Use FakeEvents: no pre-queued stale events, so drain doesn't affect window 1
         events = FakeEvents([
             ("openwindow", "0xa,1,kitty,t"),
             ("openwindow", "0xb,10,firefox,t"),
@@ -483,7 +501,7 @@ class RestoreTest(unittest.TestCase):
 
     def test_floating_entry_missing_at_is_skipped(self):
         hypr = FakeHypr()
-        events = FakeEvents([
+        events = PersistentEventBuffer([
             ("openwindow", "0xa,1,broken,t"),
             ("openwindow", "0xb,2,kitty,t"),
         ])
@@ -499,23 +517,28 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(placed, 1)
         self.assertEqual([argv[0] for _r, argv in hypr.execs], ["broken", "kitty"])
 
-    def test_stale_event_not_matched_to_next_window_same_class(self):
+    def test_drain_before_second_window_clears_stale_events(self):
         hypr = FakeHypr()
-        # Provide a stale event for the first window, then the correct event for the second.
-        # The consumed set ensures 0xa is not matched to window 2.
-        events = FakeEvents([
-            ("openwindow", "0xa,1,firefox,t"),  # event for window 1
-            ("openwindow", "0xb,2,firefox,t"),  # event for window 2
+        # Use a persistent buffer that models a real event queue.
+        # Events: kitty_event, firefox_stale, firefox_real
+        # Window 1 (kitty) consumes kitty_event
+        # Before Window 2 (firefox), drain removes firefox_stale
+        # Window 2 gets firefox_real
+        events = PersistentEventBuffer([
+            ("openwindow", "0xkitty,1,kitty,t"),  # Event for window 1
+            ("openwindow", "0xa,1,firefox,t"),    # Stale firefox event (e.g., from previous session)
+            ("openwindow", "0xb,2,firefox,t"),    # Real firefox event for window 2
         ])
         snap = {"version": 1, "windows": [
-            window(0, "firefox", 1),
-            window(1, "firefox", 2, floating=True),  # window 2 is floating
+            window(0, "kitty", 1),
+            window(1, "firefox", 2, floating=True),
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 2)
-        # Both windows should be placed. Window 2 is floating, so its address
-        # should appear in setfloating dispatch (should be 0xb, not 0xa).
+        # Window 2 is floating. Geometry should be applied to 0xb (correct), not 0xa (stale).
+        # The drain before window 2 should remove 0xa from the buffer.
         self.assertIn("setfloating address:0xb", hypr.dispatches)
+        self.assertNotIn("setfloating address:0xa", hypr.dispatches)
 
 
 if __name__ == "__main__":

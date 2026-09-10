@@ -381,19 +381,20 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     seen: dict = {}
     placed = 0
     consumed: set = set()
-    had_timeout = False
+    window_index = 0
 
     for window in windows:
+        window_index += 1
         if clock() - started > total_timeout:
             log(f"restore: total timeout, abandoning {len(windows) - placed} window(s)")
             break
 
         try:
-            # Drain stale events from previous timeouts before launching.
-            if had_timeout:
-                while list(events.events(timeout=0)):
+            # Drain any pending events before launching subsequent windows.
+            # (First window's events haven't had time to arrive yet in real scenarios.)
+            if window_index > 1:
+                for _ in events.events(timeout=0):
                     pass
-                had_timeout = False
 
             argv = restore_command(window, seen)
             rules = f"workspace {window['workspace']} silent"
@@ -406,7 +407,6 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             )
             if not address:
                 log(f"restore: {window['class']} did not map in {per_window_timeout}s")
-                had_timeout = True
                 continue
 
             if window.get("floating"):
