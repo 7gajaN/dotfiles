@@ -592,5 +592,67 @@ class RestoreTest(unittest.TestCase):
         self.assertNotIn("setfloating address:0xstale2", hypr.dispatches)
 
 
+class ScriptedEvents:
+    """Yields a scripted batch per call, then nothing."""
+
+    def __init__(self, batches):
+        self.batches = list(batches)
+
+    def events(self, timeout=None):
+        if self.batches:
+            for item in self.batches.pop(0):
+                yield item
+
+
+class WatchTest(unittest.TestCase):
+    def test_burst_of_events_produces_one_snapshot(self):
+        writes = []
+        events = ScriptedEvents([[
+            ("movewindow", "0xa,2"),
+            ("movewindow", "0xa,3"),
+            ("movewindow", "0xa,4"),
+        ]])
+        ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        self.assertEqual(len(writes), 1)
+
+    def test_irrelevant_events_never_trigger_a_snapshot(self):
+        writes = []
+        events = ScriptedEvents([[("activewindow", "kitty,title")]])
+        ticks = iter([0.0, 0.0, 5.0, 5.0, 5.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, clock=lambda: next(ticks), stop=stop)
+        self.assertEqual(writes, [])
+
+    def test_snapshot_failure_does_not_end_the_loop(self):
+        def boom():
+            raise RuntimeError("hyprctl exploded")
+
+        events = ScriptedEvents([[("openwindow", "0xa,1,kitty,t")]])
+        ticks = iter([0.0, 0.0, 2.0, 2.0, 2.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        # Must return normally rather than propagate.
+        session.watch(FakeHypr(), events, boom, debounce=1.0,
+                      clock=lambda: next(ticks), stop=stop)
+
+
 if __name__ == "__main__":
     unittest.main()

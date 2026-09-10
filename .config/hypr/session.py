@@ -433,3 +433,32 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
 
     log(f"restore: placed {placed}/{len(windows)} window(s)")
     return placed
+
+
+def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
+          clock=time.monotonic, stop=None) -> None:
+    """Rewrite the snapshot whenever windows change, debounced.
+
+    Dragging a window across workspaces emits a burst of events. Without
+    debouncing, each one would trigger a full hyprctl call and file write.
+    """
+    pending_since = None
+
+    while True:
+        if stop is not None and stop():
+            return
+        try:
+            for name, _payload in events.events(timeout=0.25):
+                if name in WINDOW_EVENTS:
+                    pending_since = clock()
+        except ConnectionError:
+            log("watch: event socket closed, exiting")
+            return
+
+        if pending_since is not None and clock() - pending_since >= debounce:
+            pending_since = None
+            try:
+                snapshot_fn()
+            except Exception as exc:
+                # A transient hyprctl or disk failure must not kill the watcher.
+                log(f"watch: snapshot failed: {exc}")
