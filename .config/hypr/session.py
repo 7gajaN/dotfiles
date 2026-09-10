@@ -14,6 +14,11 @@ import tempfile
 SCHEMA_VERSION = 1
 
 
+def log(message: str) -> None:
+    """Replaced by the file-backed logger in Task 8."""
+    print(message)
+
+
 def state_dir() -> pathlib.Path:
     """Return the state directory, honouring XDG_STATE_HOME."""
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
@@ -176,3 +181,39 @@ def should_skip(client: dict, clients: list, denylist: list,
     if is_transient(client, clients):
         return "transient"
     return None
+
+
+def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
+                   now: str) -> dict:
+    """Turn a hyprctl client list into a snapshot document.
+
+    Windows are ordered by workspace, then by their position in the client
+    list, which approximates stack order. Restoring in this order makes hy3's
+    arrival order on workspace 11 repeatable between boots.
+    """
+    ranked = []
+    for index, client in enumerate(clients):
+        command = resolve_command(client, proc)
+        reason = should_skip(client, clients, denylist, command)
+        if reason:
+            log(f"skip {client.get('class', '?')}: {reason}")
+            continue
+        ranked.append((client["workspace"]["id"], index, client, command))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+
+    windows = []
+    for order, (workspace, _index, client, command) in enumerate(ranked):
+        windows.append({
+            "order": order,
+            "class": client["class"],
+            "workspace": workspace,
+            "monitor": client["monitor"],
+            "floating": bool(client.get("floating")),
+            "at": client.get("at", [0, 0]),
+            "size": client.get("size", [0, 0]),
+            "fullscreen": client.get("fullscreen", 0),
+            "cmd": command,
+        })
+
+    return {"version": SCHEMA_VERSION, "saved_at": now, "windows": windows}

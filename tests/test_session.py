@@ -207,5 +207,71 @@ class FilteringTest(unittest.TestCase):
         self.assertIsNone(session.should_skip(client, [client], [], ["kitty"]))
 
 
+class BuildSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proc = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def client(self, cls, pid, ws, monitor="DP-2", floating=False):
+        return {
+            "class": cls, "pid": pid, "floating": floating,
+            "workspace": {"id": ws, "name": str(ws)},
+            "monitor": 0 if monitor == "DP-2" else 1,
+            "at": [10, 20], "size": [800, 600], "fullscreen": 0,
+        }
+
+    def test_orders_by_workspace_then_stack_position(self):
+        for pid, cls in ((1, "a"), (2, "b"), (3, "c")):
+            fake_proc(self.proc, pid, [cls], cls, "/home/u")
+        clients = [
+            self.client("c", 3, 10),
+            self.client("a", 1, 1),
+            self.client("b", 2, 1),
+        ]
+        snap = session.build_snapshot(clients, [], self.proc, "T")
+        self.assertEqual(
+            [(w["order"], w["class"], w["workspace"]) for w in snap["windows"]],
+            [(0, "a", 1), (1, "b", 1), (2, "c", 10)],
+        )
+
+    def test_records_schema_version_and_timestamp(self):
+        snap = session.build_snapshot([], [], self.proc, "2026-09-10T10:00:00+03:00")
+        self.assertEqual(snap["version"], 1)
+        self.assertEqual(snap["saved_at"], "2026-09-10T10:00:00+03:00")
+        self.assertEqual(snap["windows"], [])
+
+    def test_records_monitor_index_verbatim(self):
+        # hyprctl reports monitor as an index, not a name. The field is
+        # informational only: placement is driven by the workspace rule,
+        # and workspaces 1-10 and 11 are already pinned to monitors in
+        # hyprland.lua.
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        clients = [self.client("kitty", 1, 11, monitor="DP-3")]
+        snap = session.build_snapshot(clients, [], self.proc, "T")
+        self.assertEqual(snap["windows"][0]["monitor"], 1)
+
+    def test_geometry_and_fullscreen_are_preserved(self):
+        fake_proc(self.proc, 1, ["mpv"], "mpv", "/home/u")
+        c = self.client("mpv", 1, 2, floating=True)
+        c["fullscreen"] = 2
+        snap = session.build_snapshot([c], [], self.proc, "T")
+        w = snap["windows"][0]
+        self.assertEqual(w["at"], [10, 20])
+        self.assertEqual(w["size"], [800, 600])
+        self.assertEqual(w["fullscreen"], 2)
+        self.assertTrue(w["floating"])
+
+    def test_skipped_windows_are_absent_and_do_not_gap_order(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        # pid 2 has no fake /proc entry, so its command cannot be resolved.
+        clients = [self.client("kitty", 1, 1), self.client("ghost", 2, 1)]
+        snap = session.build_snapshot(clients, [], self.proc, "T")
+        self.assertEqual([w["class"] for w in snap["windows"]], ["kitty"])
+        self.assertEqual([w["order"] for w in snap["windows"]], [0])
+
+
 if __name__ == "__main__":
     unittest.main()
