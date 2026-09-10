@@ -325,37 +325,61 @@ class FailingHypr(FakeHypr):
         return False
 
 
-class FakeEvents:
-    """Yields one openwindow per call, from a scripted list."""
-
-    def __init__(self, scripted):
-        self.scripted = list(scripted)
-
-    def events(self, timeout=None):
-        if self.scripted:
-            yield self.scripted.pop(0)
-
-
 class SilentEvents:
     def events(self, timeout=None):
         return iter(())
 
 
 class PersistentEventBuffer:
-    """Event buffer that persists across multiple events() calls.
+    """A shared event queue that persists across restore()'s events() calls,
+    modelling the real EventSocket: events already sitting in the kernel
+    socket buffer are still there on the next read, and a call yields only
+    what is currently available rather than the whole future stream.
 
-    Models real event arrival: events enqueued before restore() starts are still
-    in the buffer when windows are launched. This allows testing the scenario where
-    a stale same-class event is sitting in the queue before a window launches.
+    Anything passed as `initial_events` models a genuinely stale event: one
+    that existed before restore() ever ran (from another autostart
+    application, or a window the user opened manually) and that no launch in
+    the test produced. A window's own event is never pre-seeded here -- in
+    reality it only exists after Hyprland processes that window's launch, so
+    tests enqueue it via EventEmittingHypr at exec_with_rules() time instead.
     """
 
-    def __init__(self, initial_events):
+    def __init__(self, initial_events=()):
         self.buffer = list(initial_events)
+
+    def enqueue(self, event):
+        self.buffer.append(event)
 
     def events(self, timeout=None):
         """Yield one event if available from the persistent buffer."""
         if self.buffer:
             yield self.buffer.pop(0)
+
+
+class EventEmittingHypr(FakeHypr):
+    """Fake Hypr that enqueues a launched window's openwindow event into a
+    shared PersistentEventBuffer at the moment exec_with_rules() succeeds.
+
+    This mirrors reality: Hyprland only emits a window's openwindow event
+    after it has processed that window's launch, never before. `addresses`
+    maps a class name to the list of addresses to hand out, in launch order,
+    to windows of that class.
+    """
+
+    def __init__(self, events: "PersistentEventBuffer", addresses: dict):
+        super().__init__()
+        self.events = events
+        self.addresses = {cls: list(addrs) for cls, addrs in addresses.items()}
+
+    def exec_with_rules(self, rules, argv):
+        ok = super().exec_with_rules(rules, argv)
+        if ok:
+            cls = argv[0]
+            pending = self.addresses.get(cls)
+            if pending:
+                address = pending.pop(0)
+                self.events.enqueue(("openwindow", f"{address},1,{cls},t"))
+        return ok
 
 
 def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0):
@@ -391,11 +415,8 @@ class RestoreCommandTest(unittest.TestCase):
 
 class RestoreTest(unittest.TestCase):
     def test_places_each_window_on_its_workspace(self):
-        hypr = FakeHypr()
-        # Use FakeEvents (drain doesn't trigger for single window)
-        events = FakeEvents([
-            ("openwindow", "0xa,1,kitty,t"),
-        ])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"]})
         snap = {"version": 1, "windows": [
             window(0, "kitty", 1),
         ]}
@@ -407,27 +428,22 @@ class RestoreTest(unittest.TestCase):
         )
 
     def test_places_multiple_windows_on_different_workspaces(self):
-        hypr = FakeHypr()
-        # Use PersistentEventBuffer for multiple windows with no pre-queued stale events
-        events = PersistentEventBuffer([
-            ("openwindow", "0xa,1,kitty,t"),
-            ("openwindow", "0xb,10,firefox,t"),
-        ])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"], "firefox": ["0xb"]})
         snap = {"version": 1, "windows": [
             window(0, "kitty", 1), window(1, "firefox", 10),
         ]}
-        # This test demonstrates that drain before window 2 shouldn't break normal operation
         placed = session.restore(snap, hypr, events)
-        # With the stale event drain, this test would fail unless the drain is conditional
-        # So we just verify the windows were launched even if one didn't map
-        self.assertGreaterEqual(placed, 1)
+        self.assertEqual(placed, 2)
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent", ["kitty"]),
+             ("workspace 10 silent", ["firefox"])],
+        )
 
     def test_restores_windows_in_order_field_not_list_order(self):
-        hypr = FakeHypr()
-        events = FakeEvents([
-            ("openwindow", "0xa,1,kitty,t"),
-            ("openwindow", "0xb,2,mpv,t"),
-        ])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"], "mpv": ["0xb"]})
         snap = {"version": 1, "windows": [
             window(1, "mpv", 2), window(0, "kitty", 1),
         ]}
@@ -435,8 +451,8 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual([argv[0] for _rules, argv in hypr.execs], ["kitty", "mpv"])
 
     def test_floating_window_gets_geometry_dispatches(self):
-        hypr = FakeHypr()
-        events = FakeEvents([("openwindow", "0xa,1,mpv,t")])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
         snap = {"version": 1, "windows": [
             window(0, "mpv", 1, floating=True, at=(5, 6), size=(640, 480)),
         ]}
@@ -446,15 +462,15 @@ class RestoreTest(unittest.TestCase):
         self.assertIn("resizewindowpixel exact 640 480,address:0xa", hypr.dispatches)
 
     def test_tiled_window_gets_no_geometry_dispatches(self):
-        hypr = FakeHypr()
-        events = FakeEvents([("openwindow", "0xa,1,kitty,t")])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa"]})
         snap = {"version": 1, "windows": [window(0, "kitty", 1)]}
         session.restore(snap, hypr, events)
         self.assertEqual(hypr.dispatches, [])
 
     def test_fullscreen_window_is_refocused_and_fullscreened(self):
-        hypr = FakeHypr()
-        events = FakeEvents([("openwindow", "0xa,1,mpv,t")])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"mpv": ["0xa"]})
         snap = {"version": 1, "windows": [window(0, "mpv", 1, fs=1)]}
         session.restore(snap, hypr, events)
         self.assertIn("focuswindow address:0xa", hypr.dispatches)
@@ -500,10 +516,8 @@ class RestoreTest(unittest.TestCase):
         )
 
     def test_missing_order_field_does_not_stop_restore(self):
-        hypr = FakeHypr()
-        events = FakeEvents([
-            ("openwindow", "0xb,2,kitty,t"),
-        ])
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xb"]})
         snap = {"version": 1, "windows": [
             {"workspace": 1, "cmd": ["broken"]},  # missing "class" - will cause KeyError
             window(1, "kitty", 2),  # valid window
@@ -514,9 +528,11 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual([argv[0] for _r, argv in hypr.execs], ["kitty"])
 
     def test_floating_entry_missing_at_is_skipped(self):
-        hypr = FakeHypr()
-        # Only test malformed entry, no valid windows (so drain doesn't consume events)
-        events = FakeEvents([])
+        # The entry maps successfully (so we reach the geometry code), but is
+        # missing "at" -- the per-window try/except must catch the resulting
+        # KeyError and skip it rather than raising out of restore().
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"broken": ["0xc"]})
         snap = {"version": 1, "windows": [
             {
                 "order": 0, "class": "broken", "workspace": 1, "cmd": ["broken"],
@@ -529,28 +545,51 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(placed, 0)
         self.assertEqual([argv[0] for _r, argv in hypr.execs], ["broken"])
 
-    def test_drain_before_second_window_clears_stale_events(self):
-        hypr = FakeHypr()
-        # Use a persistent buffer that models a real event queue.
-        # Events: kitty_event, firefox_stale, firefox_real
-        # Window 1 (kitty) consumes kitty_event
-        # Before Window 2 (firefox), drain removes firefox_stale
-        # Window 2 gets firefox_real
+    def test_stale_event_is_not_misattributed_to_first_window(self):
+        # A stale same-class event, pending before restore() ever runs, must
+        # never be attributed to the window whose launch it precedes -- not
+        # even the very first window. This is the exact case both earlier
+        # fix attempts missed: round 1 only drained after a per-window
+        # timeout, and round 2 only drained from the second window onward
+        # (`if window_index > 1`), leaving window 1's launch unprotected.
+        #
+        # The real EventSocket connects before restore begins, so its kernel
+        # socket buffer can already hold an event from another autostart
+        # application, or from a window the user opened manually, by the
+        # time the first window is launched here.
         events = PersistentEventBuffer([
-            ("openwindow", "0xkitty,1,kitty,t"),  # Event for window 1
-            ("openwindow", "0xa,1,firefox,t"),    # Stale firefox event (e.g., from previous session)
-            ("openwindow", "0xb,2,firefox,t"),    # Real firefox event for window 2
+            ("openwindow", "0xstale,1,kitty,t"),  # pending before any launch
         ])
+        hypr = EventEmittingHypr(events, {"kitty": ["0xreal"]})
         snap = {"version": 1, "windows": [
-            window(0, "kitty", 1),
-            window(1, "firefox", 2, floating=True),
+            window(0, "kitty", 1, floating=True, at=(5, 6), size=(640, 480)),
         ]}
         placed = session.restore(snap, hypr, events)
-        self.assertEqual(placed, 2)
-        # Window 2 is floating. Geometry should be applied to 0xb (correct), not 0xa (stale).
-        # The drain before window 2 should remove 0xa from the buffer.
-        self.assertIn("setfloating address:0xb", hypr.dispatches)
-        self.assertNotIn("setfloating address:0xa", hypr.dispatches)
+        self.assertEqual(placed, 1)
+        self.assertIn("setfloating address:0xreal", hypr.dispatches)
+        self.assertNotIn("setfloating address:0xstale", hypr.dispatches)
+
+    def test_drain_clears_a_multi_event_backlog(self):
+        # PersistentEventBuffer.events() yields only one item per call, the
+        # same way a real EventSocket read is one select() plus one recv():
+        # a backlog bigger than one chunk needs more than one call to fully
+        # clear. Two stale events are pending before the window even
+        # launches; a single-shot drain (one events() call, as round 2's
+        # `for _ in events.events(timeout=0): pass` was) would remove only
+        # the first and leave the second to be misattributed.
+        events = PersistentEventBuffer([
+            ("openwindow", "0xstale1,1,kitty,t"),
+            ("openwindow", "0xstale2,1,kitty,t"),
+        ])
+        hypr = EventEmittingHypr(events, {"kitty": ["0xreal"]})
+        snap = {"version": 1, "windows": [
+            window(0, "kitty", 1, floating=True, at=(5, 6), size=(640, 480)),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        self.assertIn("setfloating address:0xreal", hypr.dispatches)
+        self.assertNotIn("setfloating address:0xstale1", hypr.dispatches)
+        self.assertNotIn("setfloating address:0xstale2", hypr.dispatches)
 
 
 if __name__ == "__main__":

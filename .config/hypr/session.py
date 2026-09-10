@@ -381,20 +381,25 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     seen: dict = {}
     placed = 0
     consumed: set = set()
-    window_index = 0
 
     for window in windows:
-        window_index += 1
         if clock() - started > total_timeout:
             log(f"restore: total timeout, abandoning {len(windows) - placed} window(s)")
             break
 
         try:
-            # Drain any pending events before launching subsequent windows.
-            # (First window's events haven't had time to arrive yet in real scenarios.)
-            if window_index > 1:
-                for _ in events.events(timeout=0):
-                    pass
+            # Drain any events already pending, unconditionally, right before
+            # this window's launch. An event sitting in the buffer at this
+            # instant cannot belong to a launch that has not happened yet --
+            # it is stale by construction, even for the very first window,
+            # since the real EventSocket connects before restore begins and
+            # its kernel socket buffer may already hold events from other
+            # autostart applications or a window the user opened manually.
+            # Exhaustive, not single-shot: one events() call is one select +
+            # one recv, so a backlog bigger than one chunk needs more than
+            # one call to fully drain.
+            while list(events.events(timeout=0)):
+                pass
 
             argv = restore_command(window, seen)
             rules = f"workspace {window['workspace']} silent"
