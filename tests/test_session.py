@@ -787,6 +787,26 @@ class EventEmittingHypr(FakeHypr):
         return ok
 
 
+class FirstCallFailsHypr(EventEmittingHypr):
+    """Like EventEmittingHypr, but the very first exec_with_rules() call
+    fails (as a real launch failure would) and every call after that
+    behaves normally. Used to prove that a failed launch of a
+    single-instance class's first window does not forfeit the rest of that
+    class -- the next recorded entry must still be attempted.
+    """
+
+    def __init__(self, events: "PersistentEventBuffer", addresses: dict):
+        super().__init__(events, addresses)
+        self.calls = 0
+
+    def exec_with_rules(self, rules, argv):
+        self.calls += 1
+        if self.calls == 1:
+            self.execs.append((rules, argv))
+            return False
+        return super().exec_with_rules(rules, argv)
+
+
 def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0):
     return {
         "order": order, "class": cls, "workspace": ws, "monitor": 0,
@@ -1188,6 +1208,74 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         )
         self.assertEqual(placed, 1)
         self.assertEqual(hypr.execs, [("workspace 2 silent", ["firefox"])])
+
+    def test_failed_first_launch_lets_the_next_entry_of_the_class_attempt(self):
+        # A single-instance class must only be marked "seen" once a launch
+        # has actually been dispatched -- exec_with_rules() returning False
+        # means nothing was launched at all, so the class is not forfeited:
+        # the next recorded entry gets its own independent attempt, exactly
+        # as it would have before this class of window existed.
+        events = PersistentEventBuffer()
+        hypr = FirstCallFailsHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        # Two dispatch attempts, not one: the failed first did not consume
+        # the class's "already launched" slot.
+        self.assertEqual(len(hypr.execs), 2)
+        self.assertEqual(
+            [rules for rules, _argv in hypr.execs],
+            ["workspace 3 silent", "workspace 7 silent"],
+        )
+
+    def test_first_launch_never_mapping_still_skips_the_rest_of_the_class(self):
+        # The opposite case: the launch is genuinely dispatched (exec
+        # succeeds) but no matching openwindow ever arrives. This must NOT
+        # be retried -- retrying here is exactly how the duplicate-blank-
+        # Firefox-window bug happened in the first place. The class is
+        # marked seen as soon as the launch is dispatched, not only once a
+        # window is confirmed mapped, so the second entry is still skipped.
+        hypr = FakeHypr()  # exec_with_rules always succeeds, never emits an event
+        ticks = itertools.count(0.0, 5.0)
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7),
+        ]}
+        placed = session.restore(
+            snap, hypr, SilentEvents(), clock=lambda: next(ticks),
+        )
+        self.assertEqual(placed, 0)
+        # Exactly one dispatch attempt: the anti-duplicate guarantee this
+        # whole feature exists for.
+        self.assertEqual(len(hypr.execs), 1)
+        self.assertEqual(hypr.execs[0][0], "workspace 3 silent")
+
+    def test_skip_log_after_a_failed_launch_never_claims_the_window_was_restored(self):
+        # Regression for a reviewer-found bug: the skip message must only
+        # ever describe what was actually observed (a launch was
+        # dispatched), never assert that a window was successfully
+        # restored -- which would be untrue whenever the class's one
+        # dispatched launch failed to map, or a launch attempt before it
+        # failed outright.
+        events = PersistentEventBuffer()
+        hypr = FirstCallFailsHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7),
+            window(2, "firefox", 9),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        # First failed, second dispatched+mapped (marks the class seen),
+        # third is skipped.
+        self.assertEqual(len(hypr.execs), 2)
+        text = self._log()
+        self.assertIn("restore: launch failed for firefox", text)
+        self.assertIn("single-instance", text)
+        self.assertNotIn("already restored", text)
 
 
 class MalformedSnapshotRestoreTest(unittest.TestCase):

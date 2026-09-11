@@ -670,19 +670,27 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             # window of the class is launched here at all. Every later one
             # is skipped -- not attempted and not counted as placed -- and
             # logged with the reason, so the log explains why the restored
-            # count is lower than the recorded one: that window still comes
-            # back, tabs and all, through the application's own session
-            # restore, just not necessarily onto its recorded workspace,
-            # since a window created by an already-running process gets no
-            # exec rule.
+            # count is lower than the recorded one.
+            #
+            # The class is marked "seen" (below, near exec_with_rules) only
+            # once a launch for it has actually been dispatched -- not
+            # merely contemplated here, and not only once a window has been
+            # confirmed mapped. Those are deliberately different thresholds:
+            # a launch that never got dispatched (exec_with_rules returned
+            # False) must not forfeit the whole class, so the next recorded
+            # entry gets its own independent attempt, exactly as it would
+            # for any other class. But a launch that WAS dispatched and
+            # simply never mapped in time must still count as "seen" --
+            # retrying it here risks relaunching Firefox a second time and
+            # recreating the exact duplicate-blank-window bug this feature
+            # exists to eliminate. Not retrying is the safer failure.
             if cls in SINGLE_INSTANCE_CLASSES and seen.get(cls, 0) > 0:
                 log(f"restore: skipping {cls} window recorded on workspace "
                     f"{window.get('workspace')} -- {cls} is single-instance "
-                    "and was already restored once; this window will come "
-                    "back via the application's own session restore instead, "
-                    "not necessarily on this workspace")
+                    "and a launch for it was already dispatched earlier in "
+                    "this restore; not launched again here regardless of "
+                    "whether that earlier launch succeeded")
                 continue
-            seen[cls] = seen.get(cls, 0) + 1
 
             # Drain any events already pending, unconditionally, right before
             # this window's launch. An event sitting in the buffer at this
@@ -720,6 +728,16 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             if not hypr.exec_with_rules(rules, argv):
                 log(f"restore: launch failed for {window['class']}")
                 continue
+
+            # The launch was actually dispatched (exec_with_rules succeeded),
+            # so mark the class seen now -- whether or not the window goes on
+            # to map is decided next, but that outcome must not change this:
+            # see the long comment above the skip check for why both a
+            # confirmed-mapped launch and a dispatched-but-never-mapped one
+            # mark the class seen, while a launch that never dispatched at
+            # all does not.
+            if cls in SINGLE_INSTANCE_CLASSES:
+                seen[cls] = seen.get(cls, 0) + 1
 
             address = _await_window(
                 events, window["class"], clock() + per_window_timeout, clock, consumed
