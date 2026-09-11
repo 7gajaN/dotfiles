@@ -1498,6 +1498,77 @@ class WatchTest(unittest.TestCase):
                               stop=stop)
                 self.assertEqual(len(writes), 1)
 
+    # -- periodic refresh --------------------------------------------------
+    # openwindow/closewindow/movewindow(v2) see only a window's existence
+    # and geometry. They never fire for state that changes *inside* a
+    # window -- a terminal's shell cd-ing elsewhere, or an ALLOWLIST program
+    # starting up -- so watch() also captures periodically, on a timer
+    # independent of any event.
+
+    def test_no_events_but_interval_elapsed_triggers_one_capture(self):
+        """With no window events at all, the periodic timer alone must
+        still produce exactly one capture once it elapses."""
+        writes = []
+        ticks = iter([0.0, 3.0, 6.0, 6.5])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 4
+
+        session.watch(FakeHypr(), SilentEvents(), lambda: writes.append(1),
+                      debounce=1.0, interval=5.0, clock=lambda: next(ticks),
+                      stop=stop)
+        self.assertEqual(len(writes), 1)
+
+    def test_event_driven_capture_resets_the_interval_timer(self):
+        """A capture just taken via the debounce path must reset the
+        periodic timer too -- otherwise a refresh fires right behind it."""
+        writes = []
+        events = ScriptedEvents([
+            [],                          # iter1: nothing yet, bootstrap
+            [("movewindow", "0xa,2")],   # iter2: event arrives
+            [],                          # iter3: debounce not elapsed yet
+            [],                          # iter4: debounce elapses -> capture
+            [],                          # iter5: interval would have fired
+                                          #        again by now measured from
+                                          #        the original bootstrap,
+                                          #        but must not: the event
+                                          #        capture reset the clock.
+        ])
+        ticks = iter([0.0, 4.0, 4.0, 4.5, 5.5, 6.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 5
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, interval=5.0, clock=lambda: next(ticks),
+                      stop=stop)
+        self.assertEqual(len(writes), 1)
+
+    def test_event_mid_interval_still_debounces_and_is_not_lost(self):
+        """A much longer interval running in the background must not
+        swallow or duplicate the ordinary debounce-driven capture."""
+        writes = []
+        events = ScriptedEvents([
+            [("movewindow", "0xa,2")],  # event at t=0
+            [],
+            [],                          # debounce elapses at t=1.2
+        ])
+        ticks = iter([0.0, 0.0, 0.6, 1.2])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=1.0, interval=10.0, clock=lambda: next(ticks),
+                      stop=stop)
+        self.assertEqual(len(writes), 1)
+
 
 class WatchReconnectTest(unittest.TestCase):
     """The spec's error handling: "`watch` loses the socket: reconnect with
@@ -1788,6 +1859,63 @@ class CaptureTest(unittest.TestCase):
         text = self._log()
         self.assertNotIn("capture: wrote", text)
         self.assertIn("capture: skipped write", text)
+
+    # -- skip write when nothing changed ----------------------------------
+    # A periodic refresh (Task: 30s timer alongside the event trigger) must
+    # not rewrite the file, or spam the log, 2,880 times a day when nothing
+    # actually changed. saved_at differs on every build, so the comparison
+    # is against the windows list only.
+
+    def test_repeated_capture_with_no_change_does_not_rewrite(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        hypr = ClientListHypr([self.client("kitty", 1, 1)])
+        session.capture(hypr, [], self.proc, self.path)
+        on_disk_first = session.read_snapshot(self.path)
+
+        session.capture(hypr, [], self.proc, self.path)
+        on_disk_second = session.read_snapshot(self.path)
+
+        # saved_at would differ on every build; an unchanged file on disk
+        # (saved_at included) proves the second call skipped the write.
+        self.assertEqual(on_disk_second, on_disk_first)
+        self.assertIn("capture: skipped write, snapshot is unchanged", self._log())
+
+    def test_capture_writes_when_windows_actually_changed(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        hypr = ClientListHypr([self.client("kitty", 1, 1)])
+        session.capture(hypr, [], self.proc, self.path)
+        on_disk_first = session.read_snapshot(self.path)
+
+        fake_proc(self.proc, 2, ["kitty"], "kitty", "/home/u")
+        hypr2 = ClientListHypr([
+            self.client("kitty", 1, 1), self.client("kitty", 2, 1),
+        ])
+        session.capture(hypr2, [], self.proc, self.path)
+        on_disk_second = session.read_snapshot(self.path)
+
+        self.assertNotEqual(on_disk_second, on_disk_first)
+        self.assertEqual(len(on_disk_second["windows"]), 2)
+
+    def test_unchanged_capture_does_not_rotate_the_backup(self):
+        # Rotating on a no-op write would overwrite session.json.1 with an
+        # identical copy of session.json -- destroying the one recoverable
+        # previous snapshot for no reason, on every unchanged refresh.
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        hypr = ClientListHypr([self.client("kitty", 1, 1)])
+        session.capture(hypr, [], self.proc, self.path)
+
+        marker = {"version": 1, "saved_at": "T", "windows": [
+            {"order": 0, "class": "distinct-backup-marker", "workspace": 1,
+             "monitor": 0, "floating": False, "at": [0, 0], "size": [1, 1],
+             "fullscreen": 0, "cmd": ["marker"]},
+        ]}
+        session.write_snapshot(marker, session.backup_path(self.path))
+
+        session.capture(hypr, [], self.proc, self.path)
+
+        self.assertEqual(
+            session.read_snapshot(session.backup_path(self.path)), marker
+        )
 
 
 class CliTest(unittest.TestCase):

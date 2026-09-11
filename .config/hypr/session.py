@@ -403,6 +403,16 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
 # Verified present in the Hyprland 0.56.2 binary.
 WINDOW_EVENTS = frozenset({"openwindow", "closewindow", "movewindow", "movewindowv2"})
 
+# How often watch() forces a capture even with no window event, on top of
+# the event-driven trigger above. openwindow/closewindow/movewindow(v2) see
+# only a window's existence and geometry -- none of them fire for state
+# that changes *inside* a window: a terminal's shell cd-ing to a new
+# directory, or an ALLOWLIST program (e.g. claude) starting up. Without
+# this, a snapshot taken before either of those happens is what survives a
+# reboot, even though the detection itself (child_shell_cwd, child_program)
+# is correct -- the trigger to look again simply never fires.
+REFRESH_INTERVAL = 30.0
+
 
 def parse_event(line: str) -> tuple | None:
     """Split a socket2 line of the form 'eventname>>payload'."""
@@ -734,13 +744,24 @@ def compositor_is_gone(events) -> bool:
 
 
 def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
-          clock=time.monotonic, stop=None, connect=None, sleep=time.sleep,
+          interval: float = REFRESH_INTERVAL, clock=time.monotonic,
+          stop=None, connect=None, sleep=time.sleep,
           backoff_start: float = 1.0, backoff_max: float = 30.0,
           max_attempts: int = 8) -> None:
-    """Rewrite the snapshot whenever windows change, debounced.
+    """Rewrite the snapshot whenever windows change, debounced -- and also
+    every `interval` seconds regardless of events (see REFRESH_INTERVAL).
 
     Dragging a window across workspaces emits a burst of events. Without
     debouncing, each one would trigger a full hyprctl call and file write.
+
+    The event trigger and the periodic timer share one clock: a capture
+    just taken by either path resets it, so the other has no reason to fire
+    again right behind it. An event arriving mid-interval still debounces
+    normally. Nothing here decides whether the snapshot file actually gets
+    rewritten -- that guard (skip the write when the windows list did not
+    change) lives in capture(), which both triggers call through, so a
+    refresh every `interval` seconds does not spam the log or the disk when
+    nothing changed.
 
     Losing the socket is not the end of the loop. Per the spec's error
     handling: reconnect with exponential backoff; Hyprland exiting ends the
@@ -760,6 +781,7 @@ def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
     gets a full budget each time.
     """
     pending_since = None
+    last_capture = None
     attempts = 0
 
     while True:
@@ -797,8 +819,35 @@ def watch(hypr, events, snapshot_fn, debounce: float = 1.0,
             log("watch: event socket reconnected")
             continue
 
-        if pending_since is not None and clock() - pending_since >= debounce:
-            pending_since = None
+        do_capture = False
+        if pending_since is not None:
+            now = clock()
+            if last_capture is None:
+                last_capture = now
+            if now - pending_since >= debounce:
+                pending_since = None
+                last_capture = now
+                do_capture = True
+            elif now - last_capture >= interval:
+                # The debounce has not elapsed, but the periodic refresh
+                # has: capture now instead of making the periodic trigger
+                # wait for this event to finish debouncing. Either way the
+                # state just observed is fresh, so the pending event is
+                # resolved by this capture too.
+                pending_since = None
+                last_capture = now
+                do_capture = True
+        else:
+            now = clock()
+            if last_capture is None:
+                # First time through with nothing pending: start the
+                # periodic clock from here rather than firing immediately.
+                last_capture = now
+            elif now - last_capture >= interval:
+                last_capture = now
+                do_capture = True
+
+        if do_capture:
             try:
                 snapshot_fn()
             except Exception as exc:
@@ -826,6 +875,18 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     against a partial restore quietly writing a shrunken session over a good
     one, which the empty-snapshot guard above cannot catch.
 
+    watch() now captures periodically (REFRESH_INTERVAL), not just on window
+    events, to catch state that changes inside a window with no event of its
+    own. A refresh that finds nothing different must not rewrite the file or
+    spam the log every 30 seconds, so if the newly built snapshot's windows
+    match what is already on disk -- saved_at excluded, since that differs on
+    every build -- the write (and the rotation that precedes it) is skipped
+    entirely. Skipping the rotation matters as much as skipping the write:
+    rotating on a no-op would overwrite session.json.1 with an identical copy
+    of session.json, destroying the one recoverable previous snapshot for no
+    reason. This protects both triggers that feed capture(), event-driven and
+    periodic alike, since both call through here.
+
     The write itself is never allowed to propagate: write_snapshot() can
     raise OSError (an unwritable or unreachable state directory, for
     instance) and this must not take down a caller -- main()'s save mode
@@ -839,6 +900,9 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
             previous.get("windows", []) if isinstance(previous.get("windows"), list)
             else []
         )
+        if previous is not None and previous.get("windows") == snapshot["windows"]:
+            log("capture: skipped write, snapshot is unchanged")
+            return snapshot
         rotate_snapshot(path)
         try:
             write_snapshot(snapshot, path)
