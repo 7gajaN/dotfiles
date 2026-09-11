@@ -159,24 +159,40 @@ SHELLS = frozenset({"zsh", "bash", "fish", "sh", "dash"})
 # names it fall back to the plain terminal command, silently.
 ALLOWLIST = {"claude": ["claude", "--continue"]}
 
-# Applications that focus an existing window instead of opening a new one.
-# The listed arguments are added at restore time, from the second window of
-# that class onward. Expect to add entries here as single-instance
-# applications are encountered.
-QUIRKS = {"firefox": ["--new-window"]}
+# Applications that manage their own windows: launching a second "instance"
+# does not create a new window at all, it hands off to the process already
+# running and exits (confirmed live -- five Firefox windows sharing one
+# PID). There is no way to place window 2+ of one of these from outside it:
+# a window created by an already-running process gets no exec rule, and
+# `hyprctl keyword` is unavailable on this Lua-config Hyprland, so a
+# dynamic title-matched window rule is not an option either. So restore()
+# launches only the first recorded window of a class in this set, on that
+# entry's recorded workspace, and skips every other recorded window of the
+# class -- it comes back anyway, tabs and all, via the application's own
+# session restore, just not necessarily onto its recorded workspace.
+SINGLE_INSTANCE_CLASSES = frozenset({"firefox"})
+
+# Restore-time arguments that an earlier revision of this tool used to add,
+# from the second window of a class onward, to focus/open via the running
+# instance (the behaviour SINGLE_INSTANCE_CLASSES replaces). Nothing adds
+# these any more, but an on-disk snapshot written by that earlier code can
+# still carry one baked into a saved "cmd" -- and it must not be replayed --
+# so this table stays, for strip_quirk_arguments() alone.
+LEGACY_RESTORE_ARGS = {"firefox": ["--new-window"]}
 
 
 def strip_quirk_arguments(cls: str, argv: list) -> list:
-    """Drop restore-time quirk arguments from a captured command line.
+    """Drop legacy restore-time arguments from a command line.
 
-    QUIRKS arguments belong to the restore side only. A Firefox window that
-    this tool restored carries --new-window in its own /proc cmdline, so
-    saving that verbatim would put the flag in the snapshot, restore would
-    add a second copy for the second window, and the flag would accrete on
-    every save/restore cycle. Strip them at capture time and the snapshot
-    stays the command the user actually meant.
+    Used at two points: capture time (via resolve_command), so that a
+    Firefox window whose live /proc cmdline still carries --new-window
+    (because it was, say, the very first window launched at login) does not
+    put that flag in the snapshot; and restore time (via restore_command),
+    so that an OLD on-disk snapshot -- written back when restore itself
+    added --new-window -- has it stripped before the saved cmd is replayed,
+    rather than launching a flag that has not meant anything since.
     """
-    quirk_args = QUIRKS.get(cls)
+    quirk_args = LEGACY_RESTORE_ARGS.get(cls)
     if not quirk_args or not argv:
         return argv
     return [argv[0]] + [arg for arg in argv[1:] if arg not in quirk_args]
@@ -532,12 +548,18 @@ class EventSocket:
 
 
 def restore_command(window: dict, seen: dict) -> list:
-    """Return the argv for this window, applying single-instance quirks and
-    the program allowlist.
+    """Return the argv for this window, applying the program allowlist.
 
-    The QUIRKS table lives beside strip_quirk_arguments() at the top of the
-    file: these arguments are added here, at restore time, and stripped
-    again at capture time so they cannot accumulate in the snapshot.
+    `seen` is accepted for backward compatibility with every existing call
+    site, but this function no longer reads or writes it: deciding whether
+    to launch a window of a single-instance class at all is restore()'s job
+    now (SINGLE_INSTANCE_CLASSES) -- restore_command() is only ever called
+    for a window that has already been decided on, so its own behaviour is
+    the same no matter how many times, or in what order, it is called.
+
+    strip_quirk_arguments() removes any legacy restore-time argument (e.g.
+    --new-window) that an OLD on-disk snapshot's saved "cmd" might still
+    carry from before that add-at-restore behaviour was removed.
 
     A saved "program" is only ever used as a lookup key into ALLOWLIST --
     never as, or to build, anything that reaches argv directly. If the key
@@ -547,11 +569,7 @@ def restore_command(window: dict, seen: dict) -> list:
     fallback is deliberate: a stale program name must never run.
     """
     cls = window["class"]
-    count = seen.get(cls, 0)
-    seen[cls] = count + 1
-    argv = list(window["cmd"])
-    if count and cls in QUIRKS:
-        argv.extend(QUIRKS[cls])
+    argv = strip_quirk_arguments(cls, list(window["cmd"]))
     template = ALLOWLIST.get(window.get("program"))
     if template:
         argv.append("-e")
@@ -595,9 +613,16 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     as the event socket dying mid-restore.
 
     No reconciliation against live windows is performed: every entry is
-    launched unconditionally. That is correct on the boot path, where the
-    compositor is empty, and it is the only path that matters. Run by hand
-    against a populated session it duplicates windows, so it warns below.
+    launched unconditionally, with one exception (below). That is correct on
+    the boot path, where the compositor is empty, and it is the only path
+    that matters. Run by hand against a populated session it duplicates
+    windows, so it warns below.
+
+    The exception: a class in SINGLE_INSTANCE_CLASSES (Firefox) hands off to
+    its own already-running process instead of opening a new window, so only
+    the first recorded window of such a class is launched here at all -- see
+    the skip check at the top of the loop below. Every other recorded window
+    of that class is skipped, not launched, and not counted as placed.
     """
     if not isinstance(snapshot, dict):
         log(f"restore: snapshot is not an object ({type(snapshot).__name__}), "
@@ -637,6 +662,28 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             break
 
         try:
+            cls = window["class"]
+
+            # A single-instance class (Firefox: confirmed live, five windows
+            # sharing one PID) hands off to its already-running process
+            # instead of opening a new one, so only the first recorded
+            # window of the class is launched here at all. Every later one
+            # is skipped -- not attempted and not counted as placed -- and
+            # logged with the reason, so the log explains why the restored
+            # count is lower than the recorded one: that window still comes
+            # back, tabs and all, through the application's own session
+            # restore, just not necessarily onto its recorded workspace,
+            # since a window created by an already-running process gets no
+            # exec rule.
+            if cls in SINGLE_INSTANCE_CLASSES and seen.get(cls, 0) > 0:
+                log(f"restore: skipping {cls} window recorded on workspace "
+                    f"{window.get('workspace')} -- {cls} is single-instance "
+                    "and was already restored once; this window will come "
+                    "back via the application's own session restore instead, "
+                    "not necessarily on this workspace")
+                continue
+            seen[cls] = seen.get(cls, 0) + 1
+
             # Drain any events already pending, unconditionally, right before
             # this window's launch. An event sitting in the buffer at this
             # instant cannot belong to a launch that has not happened yet --

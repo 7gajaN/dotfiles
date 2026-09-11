@@ -196,30 +196,21 @@ class CommandResolutionTest(unittest.TestCase):
             session.resolve_command(client, self.proc), ["firefox", "-P", "work"]
         )
 
-    def test_restore_then_save_does_not_accumulate_quirk_arguments(self):
-        # One full cycle: two saved firefox windows -> restore adds
-        # --new-window to the second -> that argv is what /proc reports on
-        # the next capture -> the next snapshot must look like the first.
-        saved = [["firefox"], ["firefox"]]
-        for _cycle in range(3):
-            seen = {}
-            launched = [
-                session.restore_command({"class": "firefox", "cmd": cmd}, seen)
-                for cmd in saved
-            ]
-            self.assertEqual(launched, [["firefox"], ["firefox", "--new-window"]])
-            # Those launched processes are now what /proc reports.
-            recaptured = []
-            for pid, argv in enumerate(launched, start=100):
-                proc_dir = self.proc / str(pid)
-                if not proc_dir.exists():
-                    fake_proc(self.proc, pid, argv, "firefox", "/home/u")
-                recaptured.append(
-                    session.resolve_command({"class": "firefox", "pid": pid},
-                                            self.proc)
-                )
-            self.assertEqual(recaptured, [["firefox"], ["firefox"]])
-            saved = recaptured
+    def test_legacy_quirk_argument_is_stripped_and_does_not_survive_restore(self):
+        # QUIRKS used to mean "add --new-window from the second window of
+        # this class onward"; restore_command added it, and the next
+        # capture's strip_quirk_arguments() removed it again so it would not
+        # accrete. That add-at-restore behaviour is gone now (single-instance
+        # classes are launched once -- see SINGLE_INSTANCE_CLASSES in
+        # session.py and RestoreTest), but some on-disk snapshots were
+        # written by the old code and still carry --new-window baked into a
+        # saved "cmd". restore_command must still strip it via
+        # strip_quirk_arguments(), and it must never be replayed, however
+        # many times restore_command is called for the class in one restore.
+        seen = {}
+        stale_entry = {"class": "firefox", "cmd": ["firefox", "--new-window"]}
+        self.assertEqual(session.restore_command(stale_entry, seen), ["firefox"])
+        self.assertEqual(session.restore_command(stale_entry, seen), ["firefox"])
 
     def test_unreadable_process_yields_empty_command(self):
         client = {"class": "ghost", "pid": 4242}
@@ -811,12 +802,18 @@ class RestoreCommandTest(unittest.TestCase):
             session.restore_command(window(0, "firefox", 1), seen), ["firefox"]
         )
 
-    def test_second_window_of_class_gets_quirk_arguments(self):
+    def test_repeated_calls_never_add_a_quirk_argument(self):
+        # restore_command used to add --new-window from the second call for
+        # a class onward (QUIRKS). That decision moved entirely to
+        # restore()'s single-instance skip (SINGLE_INSTANCE_CLASSES) -- see
+        # RestoreTest -- so restore_command itself must now behave
+        # identically no matter how many times it is called for the same
+        # class; it never adds anything on its own.
         seen = {}
         session.restore_command(window(0, "firefox", 1), seen)
         self.assertEqual(
             session.restore_command(window(1, "firefox", 2), seen),
-            ["firefox", "--new-window"],
+            ["firefox"],
         )
 
     def test_class_without_quirk_is_never_modified(self):
@@ -1096,6 +1093,101 @@ class RestoreTest(unittest.TestCase):
             [("workspace 1 silent; float; move 5 6; size 640 480", ["kitty"])],
         )
         self.assertEqual(events.buffer, [])
+
+
+class SingleInstanceRestoreTest(unittest.TestCase):
+    """Firefox (and anything else in SINGLE_INSTANCE_CLASSES) hands off to
+    its own already-running process instead of opening a new window, so
+    only the first recorded window of such a class is ever launched.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(pathlib.Path(self.tmp.name) / "state")
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = self.saved
+        self.tmp.cleanup()
+
+    def _log(self):
+        return (session.state_dir() / "session.log").read_text()
+
+    def test_three_firefox_entries_launch_only_once_on_first_workspace(self):
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7),
+            window(2, "firefox", 9),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        self.assertEqual(hypr.execs, [("workspace 3 silent", ["firefox"])])
+
+    def test_skipped_firefox_windows_are_logged_and_not_claimed_placed(self):
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7),
+            window(2, "firefox", 9),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        text = self._log()
+        # Each of the two skipped entries is logged with a reason that
+        # explains, on its own, why it was not placed.
+        self.assertEqual(text.count("single-instance"), 2)
+        self.assertIn("workspace 7", text)
+        self.assertIn("workspace 9", text)
+        # The summary must be honest: only the one confirmed launch counts
+        # as placed, out of all three recorded entries.
+        self.assertIn("restore: placed 1/3 window(s)", text)
+
+    def test_non_single_instance_class_still_launches_every_window(self):
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"mpv": ["0xa", "0xb", "0xc"]})
+        snap = {"version": 1, "windows": [
+            window(0, "mpv", 1), window(1, "mpv", 2), window(2, "mpv", 3),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 3)
+        self.assertEqual(
+            hypr.execs,
+            [("workspace 1 silent", ["mpv"]),
+             ("workspace 2 silent", ["mpv"]),
+             ("workspace 3 silent", ["mpv"])],
+        )
+
+    def test_terminals_are_unaffected_each_gets_its_own_workspace(self):
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"kitty": ["0xa", "0xb", "0xc"]})
+        snap = {"version": 1, "windows": [
+            window(0, "kitty", 1), window(1, "kitty", 4), window(2, "kitty", 8),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 3)
+        self.assertEqual(
+            [rules for rules, _argv in hypr.execs],
+            ["workspace 1 silent", "workspace 4 silent", "workspace 8 silent"],
+        )
+
+    def test_old_snapshot_with_new_window_baked_in_is_not_replayed(self):
+        # Simulates a snapshot on disk right now, written by the previous
+        # behaviour, whose saved "cmd" already carries --new-window.
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        stale_window = window(0, "firefox", 2)
+        stale_window["cmd"] = ["firefox", "--new-window"]
+        placed = session.restore(
+            {"version": 1, "windows": [stale_window]}, hypr, events
+        )
+        self.assertEqual(placed, 1)
+        self.assertEqual(hypr.execs, [("workspace 2 silent", ["firefox"])])
 
 
 class MalformedSnapshotRestoreTest(unittest.TestCase):

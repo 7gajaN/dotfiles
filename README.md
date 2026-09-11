@@ -187,9 +187,21 @@ cp session.json.1 session.json
 `session.log` records every write as `capture: wrote N window(s) (previously
 M)`, which is how a shrinking snapshot is spotted in the first place.
 
-Single-instance applications — ones that focus an existing window instead of
-opening a new one when launched again — need an entry in the `QUIRKS` table
-in `session.py`; `firefox` is already there.
+Single-instance applications such as Firefox — ones whose already-running
+process hands off to itself instead of opening a new window when launched
+again, so a "new" window is really the same process, just told to make
+another window — are launched once, on their first recorded window's
+workspace, and left to manage the rest of their own windows. Those extra
+windows come back anyway, with their tabs, through the application's own
+session restore (Firefox's `browser.startup.page`, for instance) — but they
+land wherever the application puts them, not on their recorded workspaces,
+because a window created by an already-running process cannot be given a
+workspace rule from the outside. `session.py` logs each recorded window it
+skips this way, so the gap between the recorded and restored counts is
+explained rather than silent. Terminals and other applications that spawn
+one process per window are placed normally; add a class to
+`SINGLE_INSTANCE_CLASSES` in `session.py` if another single-instance
+application is encountered — `firefox` is already there.
 
 Tests: `python -m unittest discover -s tests`
 
