@@ -1413,6 +1413,34 @@ class SingleInstanceRuleRegistrationTest(unittest.TestCase):
         self.assertEqual(placed, 3)
         self.assertEqual(hypr.rule_calls, [])
 
+    def test_logs_running_count_of_registered_rules(self):
+        # There is no removal API for a registered window rule (see
+        # register_title_rule), so rules accumulate for the life of the
+        # Hyprland process. Nothing here dedupes or cleans that up -- the
+        # count is logged purely so the accumulation is visible.
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7, title="Skipped A"),
+            window(2, "firefox", 9, title="Skipped B"),
+        ]}
+        session.restore(snap, hypr, events)
+        text = self._log()
+        self.assertIn("1 window rule(s) registered so far this restore", text)
+        self.assertIn("2 window rule(s) registered so far this restore", text)
+
+    def test_registration_failure_does_not_advance_the_running_count(self):
+        events = PersistentEventBuffer()
+        hypr = RuleRegistrationFailsHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3),
+            window(1, "firefox", 7, title="Skipped A"),
+        ]}
+        session.restore(snap, hypr, events)
+        text = self._log()
+        self.assertNotIn("window rule(s) registered so far this restore", text)
+
 
 class MalformedSnapshotRestoreTest(unittest.TestCase):
     """restore() promises never to raise. A snapshot that is not shaped like
@@ -1490,6 +1518,19 @@ class RestoreLiveWindowWarningTest(unittest.TestCase):
     def test_no_warning_on_an_empty_compositor(self):
         session.restore({"version": 1, "windows": []}, FakeHypr(), SilentEvents())
         self.assertNotIn("WARNING", self._log())
+
+    def test_warning_mentions_accumulating_window_rules(self):
+        # There is no rule-removal call in Hyprland's Lua API, so rules
+        # registered by an earlier manual restore are still there on the
+        # next one. The existing warning about duplicated windows must
+        # also say so, since a manual restore is the only path where this
+        # can actually happen more than once in a session.
+        hypr = ClientListHypr([{"class": "kitty"}])
+        session.restore({"version": 1, "windows": []}, hypr, SilentEvents())
+        text = self._log()
+        self.assertIn("accumulate", text)
+        self.assertIn("persist", text)
+        self.assertIn("logout", text)
 
 
 class ExecWithRulesLuaEscapingTest(unittest.TestCase):

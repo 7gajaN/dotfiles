@@ -674,7 +674,7 @@ def _await_window(events, cls: str, deadline: float, clock, consumed: set | None
 
 
 def _register_rules_for_other_windows(hypr, windows: list, launching_index: int,
-                                       cls: str) -> None:
+                                       cls: str, rules_registered: int) -> int:
     """Register a placement rule for every other recorded window of `cls`.
 
     Called by restore() right before it dispatches the one launch of a
@@ -691,6 +691,19 @@ def _register_rules_for_other_windows(hypr, windows: list, launching_index: int,
     keeps today's behaviour of landing wherever is active. A registration
     failure is logged (inside Hypr, via _hyprctl) but never raised, so one
     bad rule never aborts the rest of restore().
+
+    `rules_registered` is the running count of rules successfully
+    registered so far this restore, passed in by the caller and returned
+    updated so it can be threaded through further calls (there is at most
+    one today, since only one class is single-instance, but nothing here
+    assumes that). There is no rule-removal call anywhere in Hyprland's
+    Lua API (see register_title_rule), so every rule registered here
+    outlives this process and stays active until logout or `hyprctl
+    reload` -- including one left behind by an earlier, unrelated restore.
+    This count is logged purely to make that accumulation visible, not to
+    dedupe or clean it up: a dedupe cache here would only cover rules
+    registered by this process, giving false assurance about the ones a
+    previous process left behind.
     """
     for other_index, other in enumerate(windows):
         if other_index == launching_index:
@@ -704,9 +717,15 @@ def _register_rules_for_other_windows(hypr, windows: list, launching_index: int,
         log(f"restore: registering window rule for {cls} title={title!r} "
             f"-> workspace {workspace} (a window {cls} will restore itself, "
             "not launched by this tool)")
-        if not hypr.register_title_rule(cls, title, str(workspace)):
+        if hypr.register_title_rule(cls, title, str(workspace)):
+            rules_registered += 1
+            log(f"restore: {rules_registered} window rule(s) registered so "
+                "far this restore -- registered rules have no removal API "
+                "and stay active until logout or hyprctl reload")
+        else:
             log(f"restore: failed to register window rule for {cls} "
                 f"title={title!r} -> workspace {workspace}")
+    return rules_registered
 
 
 def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
@@ -755,7 +774,11 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
         log(f"restore: WARNING {len(live)} window(s) are already open. restore "
             "does not reconcile against live windows -- every saved window is "
             "launched again, so these will be duplicated. restore is meant for "
-            "the boot path, where the compositor is empty.")
+            "the boot path, where the compositor is empty. Repeated manual "
+            "restores also accumulate window rules (registered for "
+            "single-instance classes' other windows) that persist until "
+            "logout -- there is no removal API, so they are not cleaned up "
+            "between runs.")
 
     windows = sorted(
         entries,
@@ -765,6 +788,7 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     started = clock()
     seen: dict = {}
     placed = 0
+    rules_registered = 0
     # Belt and braces alongside the unconditional exhaustive drain below: the
     # drain is what actually keeps stale events out of a launch's way, and no
     # scenario is known in which this set is the only thing preventing a
@@ -821,7 +845,8 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             # its workspace from the exec rule prefix below, and giving it
             # a second, independent rule risks the two disagreeing.
             if cls in SINGLE_INSTANCE_CLASSES:
-                _register_rules_for_other_windows(hypr, windows, index, cls)
+                rules_registered = _register_rules_for_other_windows(
+                    hypr, windows, index, cls, rules_registered)
 
             # Drain any events already pending, unconditionally, right before
             # this window's launch. An event sitting in the buffer at this
