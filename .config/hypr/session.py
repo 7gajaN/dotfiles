@@ -164,21 +164,37 @@ ALLOWLIST = {"claude": ["claude", "--continue"]}
 # running and exits (confirmed live -- five Firefox windows sharing one
 # PID). A window created this way gets no exec rule -- that prefix is only
 # applied to a window this tool itself launches -- so restore() launches
-# only the first recorded window of a class in this set, on that entry's
-# recorded workspace, and skips every other recorded window of the class:
-# it comes back anyway, tabs and all, via the application's own session
-# restore.
+# only the first recorded window of a class in this set, and skips every
+# other recorded window of the class: it comes back anyway, tabs and all,
+# via the application's own session restore.
 #
-# That does not mean the other windows are stuck wherever they land,
-# though: a Lua window_rule registered (via Hypr.register_title_rule)
-# before the launch above still applies to a window the app creates on its
-# own afterwards -- verified live. restore() registers one such rule, keyed
-# on class + recorded title, for every skipped entry that has a title (see
-# build_snapshot and the registration call near the skip check below), so
-# these windows still land on their recorded workspace even though nothing
-# here ever launches them directly. `hyprctl keyword` is not an option for
-# any of this -- it is unavailable on this Lua-config Hyprland -- but
-# `hyprctl eval hl.window_rule(...)` is.
+# That one launch carries NO workspace exec rule of its own, and is not
+# placed via its entry's recorded workspace either. An earlier revision did
+# both -- launch on the first entry's workspace, and register rules only
+# for the other, skipped entries -- on the reasoning that the launch
+# already had its placement covered. That reasoning was wrong, with
+# production evidence: the exec rule prefix is applied to whichever window
+# the process maps FIRST, which for a self-restoring single-instance app is
+# whichever window it happens to restore first -- no relationship at all to
+# the entry restore() launched it for. Observed live: a "New Tab" window
+# absorbed a `[workspace 2 silent]` prefix meant for a Jira tab, while the
+# Jira window -- the launched entry, deliberately given no rule of its own
+# -- landed on the active workspace instead. Both windows wrong.
+#
+# Title matching is the only thing that can tell these windows apart, so
+# restore() registers a Lua window_rule (via Hypr.register_title_rule),
+# keyed on class + recorded title, for EVERY recorded entry of the class
+# that has a title -- including the one about to be launched, not just the
+# ones that will be skipped (see build_snapshot and the registration call
+# near the skip check below) -- and the launch itself is dispatched with an
+# empty rules string (see Hypr.exec_with_rules), placing nothing by exec
+# rule at all. A rule registered before a matching window exists still
+# applies once it appears -- verified live. An entry with no recorded title
+# gets no rule and is simply left to land wherever the compositor puts it:
+# mis-placing a window is worse than leaving it unplaced, so no fallback
+# workspace is invented for it. `hyprctl keyword` is not an option for any
+# of this -- it is unavailable on this Lua-config Hyprland -- but `hyprctl
+# eval hl.window_rule(...)` is.
 SINGLE_INSTANCE_CLASSES = frozenset({"firefox"})
 
 # Restore-time arguments that an earlier revision of this tool used to add,
@@ -530,9 +546,14 @@ class Hypr:
 
         The rule prefix is applied when the window maps, so the window never
         appears on the wrong workspace first.
+
+        An empty `rules` produces a plain command with no "[...]" prefix at
+        all, rather than a vacuous "[] command" -- used for single-instance
+        classes (SINGLE_INSTANCE_CLASSES), which are launched with no
+        placement rule of their own; see restore().
         """
         command = " ".join(shlex.quote(part) for part in argv)
-        payload = f"[{rules}] {command}"
+        payload = f"[{rules}] {command}" if rules else command
         lua_expr = f'hl.dsp.exec_cmd("{self._lua_quote(payload)}")'
         return self._hyprctl(["dispatch", lua_expr])
 
@@ -673,18 +694,32 @@ def _await_window(events, cls: str, deadline: float, clock, consumed: set | None
     return None
 
 
-def _register_rules_for_other_windows(hypr, windows: list, launching_index: int,
-                                       cls: str, rules_registered: int) -> int:
-    """Register a placement rule for every other recorded window of `cls`.
+def _register_rules_for_class(hypr, windows: list, cls: str,
+                               rules_registered: int) -> int:
+    """Register a placement rule for every recorded window of `cls` that
+    has a title -- including the one entry restore() is about to launch.
 
     Called by restore() right before it dispatches the one launch of a
-    single-instance class. Every OTHER recorded entry of that class in this
-    snapshot is one restore() itself will never launch (SINGLE_INSTANCE_CLASSES),
-    since the already-running process creates it via its own session
-    restore instead -- with no exec rule attached. Registering a rule for
-    it now, before that launch, is what lets it land on its recorded
-    workspace anyway (verified live: a rule registered ahead of time still
-    applies to a window created later).
+    single-instance class. Every recorded entry of that class besides the
+    one being launched is one restore() itself will never launch
+    (SINGLE_INSTANCE_CLASSES), since the already-running process creates it
+    via its own session restore instead -- with no exec rule attached.
+    Registering a rule for it now, before that launch, is what lets it
+    land on its recorded workspace anyway (verified live: a rule
+    registered ahead of time still applies to a window created later).
+
+    The entry being launched gets a rule too, on the same terms, and the
+    launch itself carries no workspace exec rule (see Hypr.exec_with_rules
+    and restore()). An earlier revision excluded the launched entry here,
+    reasoning that its own exec rule prefix already placed it -- but that
+    prefix is applied to whichever window the process maps FIRST, which
+    for a self-restoring single-instance app has no relationship to the
+    entry restore() launched it for (production evidence: a "New Tab"
+    window absorbed a prefix meant for a Jira tab, and the Jira window --
+    the launched entry, given no rule of its own -- landed on the active
+    workspace instead). Title matching is the only thing that can tell
+    these windows apart, so every titled entry gets a rule, launched one
+    included.
 
     An entry with no recorded title is silently left without a rule -- an
     older snapshot, or a window whose title hyprctl reported empty, simply
@@ -705,9 +740,7 @@ def _register_rules_for_other_windows(hypr, windows: list, launching_index: int,
     registered by this process, giving false assurance about the ones a
     previous process left behind.
     """
-    for other_index, other in enumerate(windows):
-        if other_index == launching_index:
-            continue
+    for other in windows:
         if not isinstance(other, dict) or other.get("class") != cls:
             continue
         title = other.get("title")
@@ -752,12 +785,17 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     its own already-running process instead of opening a new window, so only
     the first recorded window of such a class is launched here at all -- see
     the skip check at the top of the loop below. Every other recorded window
-    of that class is skipped, not launched, and not counted as placed --
-    though, just before that one launch is dispatched, a Lua window_rule is
-    registered for each skipped entry that carries a title, so the window
-    the app creates on its own still lands on its recorded workspace (see
-    _register_rules_for_other_windows and SINGLE_INSTANCE_CLASSES). That
-    placement is unconfirmed here, hence still not counted as placed.
+    of that class is skipped, not launched, and not counted as placed.
+    Just before that one launch is dispatched, a Lua window_rule is
+    registered for every recorded entry of the class that carries a title --
+    including the one about to be launched, not only the skipped ones (see
+    _register_rules_for_class and SINGLE_INSTANCE_CLASSES) -- so each window
+    the app creates, itself included, lands on its recorded workspace by
+    title match. The launch itself is dispatched with no workspace exec
+    rule at all: that prefix would attach to whichever window the process
+    maps first, which bears no relationship to the entry it was launched
+    for. Placement by title is unconfirmed here, hence never counted as
+    placed.
     """
     if not isinstance(snapshot, dict):
         log(f"restore: snapshot is not an object ({type(snapshot).__name__}), "
@@ -835,18 +873,19 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             # This is the one window of a single-instance class that is
             # about to be launched (the check above already sent every
             # later one of the same class to "continue"). Before
-            # dispatching it, register a placement rule for every OTHER
-            # recorded window of this class that carries a title -- the
-            # ones this restore will never launch itself, because the
-            # already-running process creates them via its own session
-            # restore instead. A rule registered now still applies once
-            # such a window appears (verified live). The window about to
-            # be launched here is deliberately excluded: it already gets
-            # its workspace from the exec rule prefix below, and giving it
-            # a second, independent rule risks the two disagreeing.
+            # dispatching it, register a placement rule for every recorded
+            # window of this class that carries a title -- including this
+            # very entry, not just the others this restore will never
+            # launch itself. A rule registered now still applies once a
+            # matching window appears (verified live), and title matching
+            # is the only thing that can tell these windows apart: the
+            # exec rule prefix below is not given a workspace, since it
+            # would attach to whichever window this process happens to map
+            # first, with no relationship to this entry (see
+            # SINGLE_INSTANCE_CLASSES).
             if cls in SINGLE_INSTANCE_CLASSES:
-                rules_registered = _register_rules_for_other_windows(
-                    hypr, windows, index, cls, rules_registered)
+                rules_registered = _register_rules_for_class(
+                    hypr, windows, cls, rules_registered)
 
             # Drain any events already pending, unconditionally, right before
             # this window's launch. An event sitting in the buffer at this
@@ -862,25 +901,34 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
                 pass
 
             argv = restore_command(window, seen)
-            rule_parts = [f"workspace {window['workspace']} silent"]
-            if window.get("floating"):
-                x, y = window["at"]
-                w, h = window["size"]
-                rule_parts.append("float")
-                rule_parts.append(f"move {x} {y}")
-                rule_parts.append(f"size {w} {h}")
-            # hyprctl reports fullscreen as 0 (none), 1 (maximized) or 2
-            # (true fullscreen), and only 2 gets the rule. Emitting
-            # `fullscreen` for a maximized window makes it come back
-            # genuinely fullscreen; the next capture then records 2, and the
-            # window can never get back to maximized. The rule name that
-            # would restore maximize could not be verified without
-            # dispatching against the live session, so maximized state is
-            # deliberately not restored at all -- not restoring it is
-            # recoverable, silently converting it is not.
-            if window.get("fullscreen") == 2:
-                rule_parts.append("fullscreen")
-            rules = "; ".join(rule_parts)
+            if cls in SINGLE_INSTANCE_CLASSES:
+                # No exec rule at all -- see SINGLE_INSTANCE_CLASSES and
+                # the registration call above. Any rule here, workspace or
+                # otherwise, would apply to whichever window this process
+                # happens to map first, not necessarily this entry; the
+                # title rules registered above are the only correct way to
+                # place any window of this launch.
+                rules = ""
+            else:
+                rule_parts = [f"workspace {window['workspace']} silent"]
+                if window.get("floating"):
+                    x, y = window["at"]
+                    w, h = window["size"]
+                    rule_parts.append("float")
+                    rule_parts.append(f"move {x} {y}")
+                    rule_parts.append(f"size {w} {h}")
+                # hyprctl reports fullscreen as 0 (none), 1 (maximized) or 2
+                # (true fullscreen), and only 2 gets the rule. Emitting
+                # `fullscreen` for a maximized window makes it come back
+                # genuinely fullscreen; the next capture then records 2, and
+                # the window can never get back to maximized. The rule name
+                # that would restore maximize could not be verified without
+                # dispatching against the live session, so maximized state
+                # is deliberately not restored at all -- not restoring it is
+                # recoverable, silently converting it is not.
+                if window.get("fullscreen") == 2:
+                    rule_parts.append("fullscreen")
+                rules = "; ".join(rule_parts)
             if not hypr.exec_with_rules(rules, argv):
                 log(f"restore: launch failed for {window['class']}")
                 continue

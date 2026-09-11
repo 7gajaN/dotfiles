@@ -955,10 +955,14 @@ class RestoreTest(unittest.TestCase):
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 2)
+        # firefox is single-instance (SINGLE_INSTANCE_CLASSES): its launch
+        # carries no workspace exec rule at all, since that prefix would
+        # attach to whichever window firefox happens to map first, not
+        # necessarily this recorded entry -- see SingleInstanceRestoreTest.
         self.assertEqual(
             hypr.execs,
             [("workspace 1 silent", ["kitty"]),
-             ("workspace 10 silent", ["firefox"])],
+             ("", ["firefox"])],
         )
 
     def test_restores_windows_in_order_field_not_list_order(self):
@@ -1176,7 +1180,17 @@ class SingleInstanceRestoreTest(unittest.TestCase):
     def _log(self):
         return (session.state_dir() / "session.log").read_text()
 
-    def test_three_firefox_entries_launch_only_once_on_first_workspace(self):
+    def test_three_untitled_firefox_entries_launch_once_unplaced_with_no_rules(self):
+        # None of the three entries carries a title, so there is nothing to
+        # key a placement rule off of for any of them -- not even the
+        # launched one. The launch itself carries no workspace exec rule
+        # either: that prefix would attach to whichever window firefox
+        # happens to map first, which has no reliable relationship to any
+        # one recorded entry (production evidence: it attached to a "New
+        # Tab" window instead of the Jira tab the prefix was meant for).
+        # So the app is launched once, entirely unplaced, and lands
+        # wherever the compositor puts it -- which is the deliberate
+        # fallback: leaving a window unplaced beats mis-placing it.
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
         snap = {"version": 1, "windows": [
@@ -1186,7 +1200,8 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
-        self.assertEqual(hypr.execs, [("workspace 3 silent", ["firefox"])])
+        self.assertEqual(hypr.execs, [("", ["firefox"])])
+        self.assertEqual(hypr.rule_calls, [])
 
     def test_skipped_firefox_windows_are_logged_and_not_claimed_placed(self):
         events = PersistentEventBuffer()
@@ -1247,7 +1262,9 @@ class SingleInstanceRestoreTest(unittest.TestCase):
             {"version": 1, "windows": [stale_window]}, hypr, events
         )
         self.assertEqual(placed, 1)
-        self.assertEqual(hypr.execs, [("workspace 2 silent", ["firefox"])])
+        # No workspace exec rule either, single-instance classes are always
+        # launched unplaced now -- placement comes from title rules alone.
+        self.assertEqual(hypr.execs, [("", ["firefox"])])
 
     def test_failed_first_launch_lets_the_next_entry_of_the_class_attempt(self):
         # A single-instance class must only be marked "seen" once a launch
@@ -1266,10 +1283,10 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         # Two dispatch attempts, not one: the failed first did not consume
         # the class's "already launched" slot.
         self.assertEqual(len(hypr.execs), 2)
-        self.assertEqual(
-            [rules for rules, _argv in hypr.execs],
-            ["workspace 3 silent", "workspace 7 silent"],
-        )
+        # Neither attempt carries a workspace rule: single-instance launches
+        # are always unplaced by exec rule now, regardless of which attempt
+        # ultimately succeeds.
+        self.assertEqual([rules for rules, _argv in hypr.execs], ["", ""])
 
     def test_first_launch_never_mapping_still_skips_the_rest_of_the_class(self):
         # The opposite case: the launch is genuinely dispatched (exec
@@ -1291,7 +1308,9 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         # Exactly one dispatch attempt: the anti-duplicate guarantee this
         # whole feature exists for.
         self.assertEqual(len(hypr.execs), 1)
-        self.assertEqual(hypr.execs[0][0], "workspace 3 silent")
+        # No workspace rule on the launch itself -- placement is entirely
+        # via title rules for single-instance classes.
+        self.assertEqual(hypr.execs[0][0], "")
 
     def test_skip_log_after_a_failed_launch_never_claims_the_window_was_restored(self):
         # Regression for a reviewer-found bug: the skip message must only
@@ -1320,14 +1339,23 @@ class SingleInstanceRestoreTest(unittest.TestCase):
 
 class SingleInstanceRuleRegistrationTest(unittest.TestCase):
     """restore() registers a Lua window_rule (Hypr.register_title_rule) for
-    every SKIPPED recorded window of a single-instance class that carries a
-    title, before dispatching that class's one launch -- so a window the
-    already-running app creates on its own (Firefox's session restore)
-    still lands on its recorded workspace instead of wherever is active.
+    every recorded window of a single-instance class that carries a title --
+    including the one entry restore() itself is about to launch -- before
+    dispatching that class's one launch. So a window the already-running
+    app creates on its own (Firefox's session restore) still lands on its
+    recorded workspace instead of wherever is active.
 
-    The entry actually being launched must NOT get a rule of its own: it
-    already gets its workspace from the exec rule prefix, and a second,
-    independent rule for the same window risks the two disagreeing.
+    Originally the launched entry was excluded, on the reasoning that its
+    own exec rule prefix already placed it. That reasoning was wrong: the
+    exec rule prefix attaches to whichever window the process maps FIRST,
+    which for a self-restoring single-instance app has no relationship to
+    the entry restore() launched it for (production evidence: a "New Tab"
+    window absorbed the prefix meant for a Jira tab, and the Jira window --
+    the launched entry, with no rule of its own -- landed on the active
+    workspace instead). Title matching is the only thing that identifies
+    which window is which, so every entry with a title gets a rule, the
+    launched one included, and the launch itself carries no workspace exec
+    rule at all (see SingleInstanceRestoreTest).
     """
 
     def setUp(self):
@@ -1345,7 +1373,12 @@ class SingleInstanceRuleRegistrationTest(unittest.TestCase):
     def _log(self):
         return (session.state_dir() / "session.log").read_text()
 
-    def test_rules_registered_for_skipped_entries_not_the_launched_one(self):
+    def test_rules_registered_for_every_titled_entry_including_the_launched_one(self):
+        # Three titled entries, all firefox (single-instance): three rules
+        # registered -- one per entry, including the one restore() is about
+        # to launch -- and the launch itself carries no workspace rule
+        # (asserted separately below; register_title_rule is the only thing
+        # that can place any of these windows correctly).
         events = PersistentEventBuffer()
         hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
         snap = {"version": 1, "windows": [
@@ -1355,15 +1388,17 @@ class SingleInstanceRuleRegistrationTest(unittest.TestCase):
         ]}
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
-        # Only the two skipped entries get a rule; the launched one (ws 3)
-        # does not, since its own exec rule prefix already places it.
         self.assertEqual(
             sorted(hypr.rule_calls),
             sorted([
+                ("firefox", "Launched Window", "3"),
                 ("firefox", "Skipped A", "7"),
                 ("firefox", "Skipped B", "9"),
             ]),
         )
+        # The launch itself carries no workspace exec rule: placement comes
+        # entirely from the title rules registered above.
+        self.assertEqual(hypr.execs, [("", ["firefox"])])
 
     def test_registered_rule_carries_correct_class_title_and_workspace(self):
         events = PersistentEventBuffer()
@@ -1385,6 +1420,24 @@ class SingleInstanceRuleRegistrationTest(unittest.TestCase):
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
         self.assertEqual(hypr.rule_calls, [])
+
+    def test_untitled_entry_among_titled_ones_registers_no_rule_others_still_do(self):
+        # A mix: the launched entry and the last entry carry titles, the
+        # middle one does not. The untitled one is silently skipped; the
+        # other two -- launched entry included -- still get a rule.
+        events = PersistentEventBuffer()
+        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3, title="A"),
+            window(1, "firefox", 7),  # no title kwarg -> no "title" key
+            window(2, "firefox", 9, title="C"),
+        ]}
+        placed = session.restore(snap, hypr, events)
+        self.assertEqual(placed, 1)
+        self.assertEqual(
+            sorted(hypr.rule_calls),
+            sorted([("firefox", "A", "3"), ("firefox", "C", "9")]),
+        )
 
     def test_registration_failure_is_logged_and_restore_continues(self):
         events = PersistentEventBuffer()
@@ -1596,6 +1649,21 @@ class ExecWithRulesLuaEscapingTest(unittest.TestCase):
         # be an unterminated string, not a launch. /proc/<pid>/cmdline can
         # in principle hold one.
         self.assertEqual(session.Hypr._lua_quote("a\nb\r\n"), "a\\nb\\r\\n")
+
+    def test_empty_rules_emits_no_bracket_prefix_at_all(self):
+        # Single-instance classes (see SingleInstanceRestoreTest) are
+        # launched with an empty rules string, since any exec rule at all
+        # would attach to whichever window this already-running app maps
+        # first -- not necessarily the recorded entry it was launched for.
+        # An empty `rules` must therefore produce a plain command with no
+        # "[...]" prefix, not a vacuous "[] firefox" -- hyprctl parses the
+        # dispatch argument as Lua on this compositor, and a stray empty
+        # bracket pair is exactly the kind of thing that must be verified,
+        # not assumed.
+        lua_expr = self._dispatched_lua_expr("", ["firefox"])
+        self.assertEqual(lua_expr, 'hl.dsp.exec_cmd("firefox")')
+        self.assertNotIn("[", lua_expr)
+        self.assertNotIn("]", lua_expr)
 
     def test_newline_in_an_argument_stays_inside_the_lua_string(self):
         lua_expr = self._dispatched_lua_expr(
