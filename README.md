@@ -209,6 +209,26 @@ one process per window are placed normally; add a class to
 `SINGLE_INSTANCE_CLASSES` in `session.py` if another single-instance
 application is encountered — `firefox` is already there.
 
+Placement of these self-restored windows is best-effort, not guaranteed:
+it depends on the window's title at restore time matching what was
+recorded at save time. A title that changes in between — a notification
+counter like `(3)`, or a page that rewrites its own title after loading —
+will not match the registered rule, and that window lands wherever is
+active instead of its recorded workspace.
+
+Registered rules also have no removal call anywhere in Hyprland's Lua API,
+so each one stays active until logout or `hyprctl reload`, no matter which
+process registered it. Running `restore` by hand more than once in a
+session (see the warning above about duplicated windows) also layers
+another generation of these rules on top with no dedupe, and `session.log`
+logs a running count so the accumulation is visible.
+
+Existing snapshots written before this title-recording behaviour was added
+carry no titles at all, so the first reboot after deploying it restores
+Firefox as before but places none of its other windows — there is nothing
+to register a rule from yet. The capture that follows records titles for
+the first time, and the next reboot places them normally.
+
 Tests: `python -m unittest discover -s tests`
 
 ## Fonts Used
