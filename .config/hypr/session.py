@@ -557,19 +557,26 @@ class Hypr:
         title that later matches nothing is simply inert from then on,
         which is an acceptable cost for a best-effort placement hint.
 
-        The title is embedded twice over and the order matters: first as
-        a regex, wrapped in `^(...)$` so it matches only itself and not a
-        substring of some other window's title -- real Firefox titles
-        routinely contain regex metacharacters like `(`, `)`, `[`, `]` and
-        `.`, so this uses re.escape() rather than trusting the text raw.
-        Only after that is the whole pattern embedded as a Lua
+        Both class and title are embedded twice over, and the order
+        matters for each: first as a regex, wrapped in `^(...)$` so it
+        matches only itself and not a substring of some other window's
+        class or title -- real Firefox titles routinely contain regex
+        metacharacters like `(`, `)`, `[`, `]` and `.`, so this uses
+        re.escape() rather than trusting the text raw. `cls` gets the same
+        treatment even though the only production call path gates on
+        membership in SINGLE_INSTANCE_CLASSES (today just the literal
+        string "firefox", which has no metacharacters to begin with): that
+        gate is a convention enforced elsewhere, not something this
+        function can see, and a future class name containing a
+        metacharacter must not silently corrupt the rule. Only after the
+        regex escaping is the whole pattern embedded as a Lua
         double-quoted string literal via _lua_quote(), exactly as
         exec_with_rules() does for the command it launches. Escaping for
         Lua first and regex second would double-escape the backslashes
         re.escape() itself introduces, corrupting the pattern; regex
         first, then Lua, is the only order that produces a working rule.
         """
-        class_pattern = f"^({cls})$"
+        class_pattern = f"^({re.escape(cls)})$"
         title_pattern = f"^({re.escape(title)})$"
         lua_expr = (
             'hl.window_rule({ match = { class = "'

@@ -1640,6 +1640,23 @@ class RegisterTitleRuleTest(unittest.TestCase):
         ):
             self.assertFalse(hypr.register_title_rule("firefox", "t", "3"))
 
+    def test_class_with_regex_metacharacters_is_escaped(self):
+        # SINGLE_INSTANCE_CLASSES today only ever hands this function the
+        # literal string "firefox" (no metacharacters), so this is not
+        # exploitable yet -- but register_title_rule() itself has no way to
+        # see that gate, and a class added later that does contain
+        # metacharacters must not silently corrupt the rule. Proves `cls`
+        # gets the same re.escape()-then-Lua-quote treatment as `title`.
+        cls = "fire(fox).v2[beta]"
+        lua_expr = self._registered_lua_expr(cls, "My Window", "3")
+
+        regex_escaped = re.escape(cls)
+        lua_escaped = regex_escaped.replace("\\", "\\\\").replace('"', '\\"')
+        self.assertIn(f'class = "^({lua_escaped})$"', lua_expr)
+        # An unescaped class would let the parens/brackets act as regex
+        # grouping/character-class syntax instead of literal text.
+        self.assertNotIn('class = "^(fire(fox).v2[beta])$"', lua_expr)
+
 
 class ShouldWriteSnapshotTest(unittest.TestCase):
     def setUp(self):
