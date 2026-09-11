@@ -569,7 +569,7 @@ class Hypr:
         lua_expr = f'hl.dsp.exec_cmd("{self._lua_quote(payload)}")'
         return self._hyprctl(["dispatch", lua_expr])
 
-    def move_window(self, address: str, workspace: int) -> bool:
+    def move_window(self, address: str, workspace) -> bool:
         """Move an already-mapped window to `workspace` by address, via
         `hyprctl dispatch 'hl.dsp.window.move({ workspace = N, window =
         "address:0x..." })'`.
@@ -595,13 +595,29 @@ class Hypr:
         Hyprland address is always plain hex -- the same discipline
         exec_with_rules() applies to argv.
 
-        Failure is logged (inside Hypr, via _hyprctl) and returns False; it
-        must never raise, since the reconciliation phase that calls this
-        must never abort a restore over one bad move.
+        `workspace` is whatever a recorded snapshot entry's "workspace"
+        field happens to hold -- not guaranteed to be int-convertible (a
+        hand-edited or corrupted snapshot could record `null`, say). The
+        int() conversion is therefore inside this method's own try/except,
+        not left to the caller or to _hyprctl's: a reviewer-caught defect
+        had it outside, so a malformed workspace raised TypeError straight
+        out of this method, over _hyprctl entirely, which meant the caller
+        (the reconciliation phase) saw an exception instead of the ordinary
+        False-and-logged failure every other path through this method
+        produces. Every failure here -- a bad workspace value or a failed
+        dispatch -- is logged and returns False; this method must never
+        raise, since the reconciliation phase that calls this must never
+        abort a restore over one bad move.
         """
+        try:
+            ws = int(workspace)
+        except (TypeError, ValueError) as exc:
+            log(f"move_window: invalid workspace {workspace!r} for "
+                f"{address}, not moved: {exc}")
+            return False
         lua_expr = (
             "hl.dsp.window.move({ workspace = "
-            f'{int(workspace)}, window = "address:{self._lua_quote(address)}" }})'
+            f'{ws}, window = "address:{self._lua_quote(address)}" }})'
         )
         return self._hyprctl(["dispatch", lua_expr])
 
@@ -758,7 +774,12 @@ def _reconcile_single_instance_placements(
     otherwise the move is attempted and its outcome logged either way. A
     move_window() failure is logged and does not stop the phase -- the
     remaining targets still get their turn, and every failure is
-    independent of every other.
+    independent of every other. The workspace comparison and the move
+    attempt for one already-consumed target are further wrapped in their
+    own try/except, so an unanticipated failure processing that one target
+    (a malformed recorded workspace, say) costs only that target: it is
+    logged and the loop moves on to the next client, exactly as a
+    malformed window entry costs only itself in restore()'s own main loop.
 
     Whatever is still unmatched once the deadline passes is logged by title,
     so a drifted or never-appearing window is visible in session.log instead
@@ -813,16 +834,30 @@ def _reconcile_single_instance_placements(
             targets.remove(target)
             handled_addresses.add(address)
             remaining -= 1
-            _, _, workspace = target
-            current_workspace = (client.get("workspace") or {}).get("id")
-            if current_workspace == workspace:
-                continue
-            if hypr.move_window(address, workspace):
-                log(f"restore: reconcile moved {cls} {title!r} to "
-                    f"workspace {workspace} (address {address})")
-            else:
-                log(f"restore: reconcile failed to move {cls} {title!r} "
-                    f"to workspace {workspace} (address {address})")
+            # Guarded per target: move_window() is written to never raise
+            # (see its docstring), but this still wraps its own call and
+            # the workspace-comparison around it, defense in depth against
+            # anything unanticipated in this per-client body -- the same
+            # reasoning that makes restore()'s own main loop catch
+            # exceptions per malformed window entry rather than trusting
+            # every helper it calls to never raise. A bad target must cost
+            # only that target: every other one still gets its turn, and
+            # the phase must still reach its final focus_workspace() call
+            # below regardless of what happens to any single target here.
+            try:
+                _, _, workspace = target
+                current_workspace = (client.get("workspace") or {}).get("id")
+                if current_workspace == workspace:
+                    continue
+                if hypr.move_window(address, workspace):
+                    log(f"restore: reconcile moved {cls} {title!r} to "
+                        f"workspace {workspace} (address {address})")
+                else:
+                    log(f"restore: reconcile failed to move {cls} {title!r} "
+                        f"to workspace {workspace} (address {address})")
+            except Exception as exc:
+                log(f"restore: reconcile failed to process {cls} "
+                    f"{title!r} (address {address}): {exc!r}")
 
         if remaining <= 0:
             break

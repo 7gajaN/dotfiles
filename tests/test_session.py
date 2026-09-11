@@ -869,6 +869,28 @@ class ReconcileHypr(EventEmittingHypr):
         return True
 
 
+class RealMoveHypr(session.Hypr):
+    """Uses the REAL Hypr.move_window() and Hypr.focus_workspace() -- the
+    methods under test for the invalid-workspace guard -- so a regression
+    in either method's error handling (e.g. the int() conversion moving
+    back outside its try/except) is caught here, unlike ReconcileHypr's
+    fully-faked move_window()/focus_workspace() which cannot see it. Only
+    the actual subprocess boundary (_hyprctl) and clients() are stubbed, so
+    no real hyprctl process ever runs.
+    """
+
+    def __init__(self, live_clients):
+        self.live_clients = list(live_clients)
+        self.hyprctl_calls = []
+
+    def clients(self):
+        return self.live_clients
+
+    def _hyprctl(self, args):
+        self.hyprctl_calls.append(list(args))
+        return True
+
+
 def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0,
            title=None):
     entry = {
@@ -1515,6 +1537,40 @@ class ReconcilePlacementTest(unittest.TestCase):
         # ...and the phase still finished, restoring focus.
         self.assertEqual(hypr.focus_calls, [session.RECONCILE_FOCUS_WORKSPACE])
 
+    def test_a_none_workspace_target_is_logged_and_skipped_others_still_moved(self):
+        # Reviewer-caught defect: a recorded entry whose "workspace" is None
+        # (a corrupted or hand-edited snapshot) used to raise TypeError out
+        # of move_window(), abandoning every other target mid-phase and
+        # skipping the final focus_workspace() call. Uses RealMoveHypr (the
+        # actual move_window()/focus_workspace() bodies) rather than
+        # ReconcileHypr's faked ones, since a fake move_window cannot
+        # exercise the int() conversion this test is about.
+        hypr = RealMoveHypr([
+            live_client("firefox", "Bad", "0xBad", 1),
+            live_client("firefox", "Good", "0xGood", 1),
+        ])
+        windows = [
+            window(0, "firefox", None, title="Bad"),
+            window(1, "firefox", 7, title="Good"),
+        ]
+        session._reconcile_single_instance_placements(
+            hypr, windows, self._clock(), sleep=lambda s: None,
+        )
+        move_calls = [c for c in hypr.hyprctl_calls
+                      if c[0] == "dispatch" and "window.move" in c[1]]
+        focus_calls = [c for c in hypr.hyprctl_calls
+                       if c[0] == "dispatch" and "hl.dsp.focus" in c[1]]
+        # The bad target never produced a working move -- only "Good" did.
+        self.assertEqual(len(move_calls), 1)
+        self.assertIn("address:0xGood", move_calls[0][1])
+        self.assertIn("workspace = 7", move_calls[0][1])
+        # It was logged, by title, rather than silently dropped.
+        text = self._log()
+        self.assertIn("Bad", text)
+        self.assertIn("invalid workspace", text.lower())
+        # And the phase still reached its one focus call at the end.
+        self.assertEqual(len(focus_calls), 1)
+
 
 class MalformedSnapshotRestoreTest(unittest.TestCase):
     """restore() promises never to raise. A snapshot that is not shaped like
@@ -1732,6 +1788,19 @@ class HyprMoveAndFocusTest(unittest.TestCase):
         self.assertTrue(result)
         lua_expr = run.call_args.args[0][2]
         self.assertIn('address:weird\\"addr', lua_expr)
+
+    def test_move_window_with_a_non_numeric_workspace_returns_false_not_raise(self):
+        # Reviewer-caught defect: int(workspace) used to run outside
+        # _hyprctl's try/except, so a malformed recorded workspace (e.g.
+        # None, from a corrupted snapshot) raised TypeError straight out of
+        # move_window() instead of the ordinary logged-False failure every
+        # other path through this method produces. No hyprctl subprocess
+        # should even be attempted once the conversion itself has failed.
+        hypr = session.Hypr()
+        with mock.patch.object(session.subprocess, "run") as run:
+            result = hypr.move_window("0xabc", None)
+        self.assertFalse(result)
+        run.assert_not_called()
 
     def test_focus_workspace_dispatches_the_verified_live_expression(self):
         result, run = self._dispatch_args("focus_workspace", 4)
