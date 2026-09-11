@@ -193,11 +193,17 @@ again, so a "new" window is really the same process, just told to make
 another window — are launched once, on their first recorded window's
 workspace, and left to manage the rest of their own windows. Those extra
 windows come back anyway, with their tabs, through the application's own
-session restore (Firefox's `browser.startup.page`, for instance) — but they
-land wherever the application puts them, not on their recorded workspaces,
-because a window created by an already-running process cannot be given a
-workspace rule from the outside. `session.py` logs each recorded window it
-skips this way, so the gap between the recorded and restored counts is
+session restore (Firefox's `browser.startup.page`, for instance), and
+`session.py` still places them on their recorded workspaces: before that
+one launch, it registers a Hyprland window rule (via `hyprctl eval
+hl.window_rule(...)`) matched on class and recorded title for every other
+window of that class, and a rule registered ahead of time still applies to
+a window the app goes on to create by itself. That placement depends on
+the recorded title still matching by the time the window reappears — a
+tab switch between saving and restoring changes it — so it is best-effort,
+not guaranteed. `session.py` logs each recorded window it skips launching
+this way, and separately logs each window rule it registers (and any that
+fails to register), so both the skip and the placement attempt are
 explained rather than silent. Terminals and other applications that spawn
 one process per window are placed normally; add a class to
 `SINGLE_INSTANCE_CLASSES` in `session.py` if another single-instance
