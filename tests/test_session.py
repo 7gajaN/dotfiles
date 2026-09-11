@@ -349,6 +349,106 @@ class ProgramDetectionTest(unittest.TestCase):
         self.assertIsNone(session.child_shell_cwd(60, self.proc))
 
 
+class TmuxSessionDetectionTest(unittest.TestCase):
+    """find_tmux_session()/resolve_tmux_session() walk the same two tree
+    shapes child_program() does, but the gate is membership in the pid ->
+    session-name map from `tmux list-clients` (tmux_client_sessions()), not
+    a fixed name table -- a tmux client's own comm/cmdline is never
+    inspected to make this decision.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proc = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_direct_tmux_client_is_recorded(self):
+        # kitty -e tmux ...: tmux is kitty's direct child, no shell between.
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["tmux"], "tmux", "/home/u/project")
+        tmux_clients = {41: "work"}
+        self.assertEqual(
+            session.find_tmux_session(40, self.proc, tmux_clients), "work"
+        )
+        client = {"class": "kitty", "pid": 40}
+        self.assertEqual(
+            session.resolve_tmux_session(client, self.proc, tmux_clients), "work"
+        )
+
+    def test_grandchild_tmux_client_is_recorded(self):
+        # kitty -> zsh -> tmux: the user typed `tmux` at an interactive shell.
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["tmux"], "tmux", "/home/u/project")
+        tmux_clients = {42: "probesession"}
+        self.assertEqual(
+            session.find_tmux_session(40, self.proc, tmux_clients), "probesession"
+        )
+        client = {"class": "kitty", "pid": 40}
+        self.assertEqual(
+            session.resolve_tmux_session(client, self.proc, tmux_clients),
+            "probesession",
+        )
+
+    def test_no_tmux_client_records_nothing(self):
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project")
+        client = {"class": "kitty", "pid": 40}
+        self.assertIsNone(
+            session.resolve_tmux_session(client, self.proc, {99999: "unrelated"})
+        )
+
+    def test_non_terminal_class_is_never_inspected(self):
+        # Even with a matching pid in the client map, a non-TERMINALS class
+        # must never be walked -- mirrors resolve_program's own gate.
+        fake_proc(self.proc, 40, ["firefox"], "firefox", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["tmux"], "tmux", "/home/u")
+        client = {"class": "firefox", "pid": 40}
+        self.assertIsNone(
+            session.resolve_tmux_session(client, self.proc, {41: "work"})
+        )
+
+    def test_empty_client_map_records_nothing_and_does_not_crash(self):
+        # Normal states: tmux not installed, or no server running.
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["-zsh"], "zsh", "/home/u/project", children=[42])
+        fake_proc(self.proc, 42, ["tmux"], "tmux", "/home/u/project")
+        client = {"class": "kitty", "pid": 40}
+        self.assertIsNone(session.resolve_tmux_session(client, self.proc, {}))
+        self.assertIsNone(session.resolve_tmux_session(client, self.proc, None))
+
+    def test_hostile_session_name_is_skipped_and_logged(self):
+        # A hostile name observed from list-clients (in principle tmux
+        # imposes its own restrictions on session names, but this must not
+        # depend on that) must never be recorded -- the window then restores
+        # as a plain terminal, exactly as if no tmux client were found.
+        fake_proc(self.proc, 40, ["kitty"], "kitty", "/home/u", children=[41])
+        fake_proc(self.proc, 41, ["tmux"], "tmux", "/home/u")
+        hostile = "x\"; rm -rf ~ #"
+        client = {"class": "kitty", "pid": 40}
+        with mock.patch.object(session, "log") as mock_log:
+            result = session.resolve_tmux_session(client, self.proc, {41: hostile})
+        self.assertIsNone(result)
+        self.assertTrue(
+            any("skipped" in call.args[0] or "validation" in call.args[0]
+                for call in mock_log.call_args_list),
+            mock_log.call_args_list,
+        )
+
+    def test_valid_session_names_pass_validation(self):
+        for name in ("work", "work-2", "my_session", "v1.2", "A"):
+            with self.subTest(name=name):
+                self.assertTrue(session.is_valid_tmux_session_name(name))
+
+    def test_invalid_session_names_fail_validation(self):
+        for name in ("has space", "semi;colon", "dollar$sign", 'quote"here',
+                     "back`tick", "new\nline", "", "pipe|char", "amp&sand"):
+            with self.subTest(name=name):
+                self.assertFalse(session.is_valid_tmux_session_name(name))
+
+
 class FilteringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -583,6 +683,32 @@ class BuildSnapshotTest(unittest.TestCase):
         snap = session.build_snapshot([c], [], self.proc, "T")
         self.assertNotIn("title", snap["windows"][0])
 
+    def test_tmux_session_is_recorded_when_a_client_is_attached(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u", children=[2])
+        fake_proc(self.proc, 2, ["-zsh"], "zsh", "/home/u/project", children=[3])
+        fake_proc(self.proc, 3, ["tmux"], "tmux", "/home/u/project")
+        snap = session.build_snapshot(
+            [self.client("kitty", 1, 1)], [], self.proc, "T",
+            tmux_clients={3: "work"},
+        )
+        self.assertEqual(snap["windows"][0]["tmux_session"], "work")
+
+    def test_no_tmux_session_key_when_no_client_is_attached(self):
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u", children=[2])
+        fake_proc(self.proc, 2, ["-zsh"], "zsh", "/home/u/project")
+        snap = session.build_snapshot(
+            [self.client("kitty", 1, 1)], [], self.proc, "T", tmux_clients={},
+        )
+        self.assertNotIn("tmux_session", snap["windows"][0])
+
+    def test_no_tmux_session_key_when_tmux_clients_omitted(self):
+        # Callers that never pass tmux_clients at all (every existing call
+        # site before this feature) must see identical behaviour -- no key,
+        # no crash.
+        fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
+        snap = session.build_snapshot([self.client("kitty", 1, 1)], [], self.proc, "T")
+        self.assertNotIn("tmux_session", snap["windows"][0])
+
 
 class EventParsingTest(unittest.TestCase):
     def test_parses_event_and_payload(self):
@@ -731,6 +857,70 @@ class HyprClientsTest(unittest.TestCase):
                 return_value=mock.Mock(stdout='[{"class": "kitty"}]')
             ),
             [{"class": "kitty"}],
+        )
+
+
+class TmuxClientSessionsTest(unittest.TestCase):
+    """tmux_client_sessions() must return {} on every failure rather than
+    raise -- tmux not installed, no server running, and malformed output are
+    all normal states, not error conditions.
+
+    A module function, not a method on Hypr: Hypr is deliberately the
+    compositor adapter (see its own docstring -- "every call into the
+    compositor goes through here"), and tmux list-clients is not a call
+    into Hyprland at all. Keeping it a free function avoids stretching that
+    boundary, and nothing here needs Hypr's thin-fake-for-testing structure
+    since it takes no compositor state as input.
+    """
+
+    def sessions_with(self, **run_kwargs):
+        with mock.patch.object(session.subprocess, "run", **run_kwargs):
+            return session.tmux_client_sessions()
+
+    def test_parses_pid_and_session_name(self):
+        self.assertEqual(
+            self.sessions_with(
+                return_value=mock.Mock(stdout="51880 probesession\n60000 other\n")
+            ),
+            {51880: "probesession", 60000: "other"},
+        )
+
+    def test_tmux_not_installed_returns_empty(self):
+        self.assertEqual(
+            self.sessions_with(side_effect=FileNotFoundError("tmux")), {}
+        )
+
+    def test_no_server_running_returns_empty(self):
+        # `tmux list-clients` with no server exits non-zero; check=True
+        # turns that into CalledProcessError, a SubprocessError subclass.
+        self.assertEqual(
+            self.sessions_with(
+                side_effect=session.subprocess.CalledProcessError(1, "tmux")
+            ),
+            {},
+        )
+
+    def test_timeout_returns_empty(self):
+        self.assertEqual(
+            self.sessions_with(
+                side_effect=session.subprocess.TimeoutExpired("tmux", 10)
+            ),
+            {},
+        )
+
+    def test_malformed_output_lines_are_skipped_not_raised(self):
+        self.assertEqual(
+            self.sessions_with(
+                return_value=mock.Mock(
+                    stdout="not-a-pid somesession\n\n51880 good\n"
+                )
+            ),
+            {51880: "good"},
+        )
+
+    def test_empty_output_returns_empty(self):
+        self.assertEqual(
+            self.sessions_with(return_value=mock.Mock(stdout="")), {}
         )
 
 
@@ -979,6 +1169,63 @@ class RestoreCommandTest(unittest.TestCase):
             argv,
             ["kitty", "--directory", "/home/u", "-e", "claude", "--continue"],
         )
+
+    def test_tmux_session_builds_new_dash_capital_a_command(self):
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["cmd"] = ["kitty", "--directory", "/home/gion/coding/MS"]
+        w["tmux_session"] = "work"
+        self.assertEqual(
+            session.restore_command(w, seen),
+            ["kitty", "--directory", "/home/gion/coding/MS", "-e",
+             "tmux", "new", "-A", "-s", "work"],
+        )
+
+    def test_tmux_session_wins_over_program(self):
+        # A terminal running tmux should reattach; whatever ALLOWLIST
+        # program is also recorded is not restore's business -- tmux's
+        # saved contents (via resurrect/continuum) is.
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["cmd"] = ["kitty", "--directory", "/home/u"]
+        w["tmux_session"] = "work"
+        w["program"] = "claude"
+        argv = session.restore_command(w, seen)
+        self.assertEqual(
+            argv,
+            ["kitty", "--directory", "/home/u", "-e", "tmux", "new", "-A",
+             "-s", "work"],
+        )
+        self.assertNotIn("claude", argv)
+
+    def test_program_only_entry_still_restores_via_allowlist_unchanged(self):
+        # No tmux_session at all: the ALLOWLIST path must behave exactly as
+        # it always has.
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["cmd"] = ["kitty", "--directory", "/home/u"]
+        w["program"] = "claude"
+        self.assertEqual(
+            session.restore_command(w, seen),
+            ["kitty", "--directory", "/home/u", "-e", "claude", "--continue"],
+        )
+
+    def test_hostile_tmux_session_is_not_interpolated_into_the_command(self):
+        # Defense in depth against a hand-edited or corrupted snapshot: even
+        # though build_snapshot/resolve_tmux_session never records a name
+        # that fails validation, restore_command must not trust an on-disk
+        # "tmux_session" field blindly either -- the same trust boundary
+        # ALLOWLIST's own docstring calls out for "program". A name that
+        # fails validation here is treated exactly like one that was never
+        # recorded: falls through to ALLOWLIST if present, else plain.
+        seen = {}
+        w = window(0, "kitty", 1)
+        w["cmd"] = ["kitty", "--directory", "/home/u"]
+        w["tmux_session"] = "x\"; rm -rf ~ #"
+        argv = session.restore_command(w, seen)
+        self.assertEqual(argv, ["kitty", "--directory", "/home/u"])
+        self.assertNotIn("tmux", argv)
+        self.assertNotIn("rm", " ".join(argv))
 
 
 class RestoreTest(unittest.TestCase):

@@ -324,6 +324,135 @@ def child_program(pid: int, proc: pathlib.Path) -> str | None:
     return None
 
 
+# Session names are observed data -- read from `tmux list-clients`, not
+# something this tool controls -- and, unlike ALLOWLIST's fixed templates,
+# get interpolated directly into a restore command line (see
+# restore_command). That makes an allow-list the right shape of check:
+# deny-listing shell metacharacters is exactly the kind of validation that
+# misses the one character nobody thought of. shlex.quote (per argv element)
+# and _lua_quote (the Lua string literal the whole payload is later embedded
+# in, inside Hypr.exec_with_rules) both still run on top of this, but
+# neither is a substitute -- this is the gate that decides whether a name is
+# trusted to be a tmux session at all, before either of those ever sees it.
+TMUX_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def is_valid_tmux_session_name(name) -> bool:
+    """True if `name` is safe to interpolate into a restore command line.
+
+    Deliberately conservative: letters, digits, and a small set of safe
+    punctuation (`_ - .`). Whitespace, control characters, shell
+    metacharacters and quotes of any kind all fail -- there is no attempt to
+    special-case which of those is "the dangerous one".
+    """
+    return isinstance(name, str) and bool(TMUX_SESSION_NAME_RE.fullmatch(name))
+
+
+def find_tmux_session(pid: int, proc: pathlib.Path, tmux_clients: dict) -> str | None:
+    """Return the tmux session name attached by a descendant of `pid`, or None.
+
+    Walks the same two tree shapes child_program() does, in the same order:
+    a grandchild via an interactive shell first (kitty -> zsh -> tmux, the
+    user typed `tmux` at the shell prompt), then a direct child (kitty -e
+    tmux ..., where kitty launches tmux itself and there is no shell in
+    between).
+
+    Unlike child_program(), which reads a comm name only to check it against
+    ALLOWLIST's fixed table, this reads no name or cmdline at all: membership
+    in `tmux_clients` -- the pid -> session-name map built by
+    tmux_client_sessions() from `tmux list-clients`, the one authoritative
+    source -- is the only test. A tmux client's own /proc cmdline is
+    deliberately never consulted for the session name (see
+    tmux_client_sessions()'s docstring for why: it is only present if the
+    user happened to type `-s <name>`).
+    """
+    if not tmux_clients:
+        return None
+    children = _children(pid, proc)
+    for child in children:
+        if _comm(child, proc) in SHELLS:
+            for grandchild in _children(child, proc):
+                if grandchild in tmux_clients:
+                    return tmux_clients[grandchild]
+    for child in children:
+        if child in tmux_clients:
+            return tmux_clients[child]
+    return None
+
+
+def resolve_tmux_session(client: dict, proc: pathlib.Path,
+                          tmux_clients: dict) -> str | None:
+    """Return the validated tmux session name attached inside this window.
+
+    Only TERMINALS classes are ever inspected, exactly like resolve_program
+    -- a tmux client running inside, say, a browser is not something this
+    tool can identify.
+
+    A name found via find_tmux_session() that fails is_valid_tmux_session_name()
+    is logged and treated as not found, so build_snapshot never records one
+    that could reach a command line unsafely: the window it belongs to
+    simply restores as a plain terminal instead (or via ALLOWLIST, if it
+    also carries a valid "program") -- the same silent-fallback behaviour an
+    ALLOWLIST miss already has.
+    """
+    if client.get("class") not in TERMINALS:
+        return None
+    name = find_tmux_session(client["pid"], proc, tmux_clients)
+    if name is None:
+        return None
+    if not is_valid_tmux_session_name(name):
+        log(f"tmux: session name {name!r} failed validation, not recorded "
+            f"for pid {client.get('pid')}")
+        return None
+    return name
+
+
+def tmux_client_sessions() -> dict:
+    """Return {client_pid: session_name} for every attached tmux client.
+
+    `tmux list-clients -F '#{client_pid} #{session_name}'` is the one
+    authoritative source for which session a tmux client process is attached
+    to. The client's own /proc cmdline is not a substitute: it only shows a
+    session name when the user happened to type `-s <name>` -- `tmux attach`
+    or a bare `tmux` carries none at all -- so parsing cmdline would silently
+    miss most real attachments. This is verified live: `tmux new -A -s
+    probesession` on a pty shows up in `list-clients` correctly keyed by
+    that pty's client pid.
+
+    A module function, not a method on Hypr: Hypr is deliberately kept as
+    the compositor adapter ("every call into the compositor goes through
+    here" -- see its own docstring), and a tmux command is not a call into
+    Hyprland. Nothing here needs Hypr's thin-fake-for-tests shape either,
+    since this takes no compositor state as input and every caller can fake
+    it by passing a plain dict.
+
+    Returns {} -- never raises -- when tmux is not installed, no server is
+    running (`list-clients` exits non-zero with no server), or the output
+    cannot be parsed. All three are normal, common states: most terminals
+    are not running tmux at all, so this is not logged as an error.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "list-clients", "-F", "#{client_pid} #{session_name}"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    sessions: dict = {}
+    for line in out.splitlines():
+        parts = line.strip().split(" ", 1)
+        if len(parts) != 2:
+            continue
+        pid_text, name = parts
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if name:
+            sessions[pid] = name
+    return sessions
+
+
 def resolve_program(client: dict, proc: pathlib.Path) -> str | None:
     """Return the allowlisted program running inside this window, or None.
 
@@ -413,13 +542,22 @@ def should_skip(client: dict, clients: list, denylist: list,
 
 
 def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
-                   now: str) -> dict:
+                   now: str, tmux_clients: dict | None = None) -> dict:
     """Turn a hyprctl client list into a snapshot document.
 
     Windows are ordered by workspace, then by their position in the client
     list, which approximates stack order. Restoring in this order makes hy3's
     arrival order on workspace 11 repeatable between boots.
+
+    `tmux_clients` is the pid -> session-name map from tmux_client_sessions()
+    (or {} / None, treated the same, for every caller that predates this
+    parameter or has nothing to offer -- tmux not installed, no server
+    running). A tmux session name is stable for the life of the session
+    (unlike a single-instance class's title, which churns constantly), so
+    recording it does not add to the periodic refresh's unchanged-write
+    churn the way a per-window title would.
     """
+    tmux_clients = tmux_clients or {}
     ranked = []
     for index, client in enumerate(clients):
         command = resolve_command(client, proc)
@@ -447,6 +585,9 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
         program = resolve_program(client, proc)
         if program:
             entry["program"] = program
+        tmux_session = resolve_tmux_session(client, proc, tmux_clients)
+        if tmux_session:
+            entry["tmux_session"] = tmux_session
         if client["class"] in SINGLE_INSTANCE_CLASSES:
             # Only single-instance classes get a recorded title: restore()
             # matches it against each live window's title, after the fact,
@@ -672,7 +813,8 @@ class EventSocket:
 
 
 def restore_command(window: dict, seen: dict) -> list:
-    """Return the argv for this window, applying the program allowlist.
+    """Return the argv for this window, applying tmux reattachment and then
+    the program allowlist.
 
     `seen` is accepted for backward compatibility with every existing call
     site, but this function no longer reads or writes it: deciding whether
@@ -685,6 +827,27 @@ def restore_command(window: dict, seen: dict) -> list:
     --new-window) that an OLD on-disk snapshot's saved "cmd" might still
     carry from before that add-at-restore behaviour was removed.
 
+    "tmux_session" takes precedence over "program": a terminal that was
+    attached to tmux reattaches to that exact session
+    (`tmux new -A -s <name>`, which attaches if the session already exists --
+    e.g. tmux-continuum restored it first -- and creates it otherwise), and
+    whatever ALLOWLIST program was also observed running inside is not this
+    tool's business any more, since it is tmux's contents to restore (via
+    tmux-resurrect/continuum), not ours.
+
+    Unlike "program", which is only ever used as a lookup key into
+    ALLOWLIST and never reaches argv itself, "tmux_session" IS interpolated
+    directly into the command line -- it has to be, there is no fixed
+    template that could stand in for an arbitrary session name. So it is
+    re-validated here with is_valid_tmux_session_name(), on top of
+    resolve_tmux_session() already having validated it at capture time: an
+    on-disk snapshot is the same trust boundary ALLOWLIST's own docstring
+    calls out, and this field must not be able to smuggle something past
+    that boundary just because it came from a hand-edited or corrupted
+    snapshot file. A name that fails here is treated exactly like one that
+    was never recorded: falls through to ALLOWLIST below if "program" is
+    also present, else the plain terminal command.
+
     A saved "program" is only ever used as a lookup key into ALLOWLIST --
     never as, or to build, anything that reaches argv directly. If the key
     is missing, or names something no longer in ALLOWLIST (the table shrank
@@ -694,6 +857,13 @@ def restore_command(window: dict, seen: dict) -> list:
     """
     cls = window["class"]
     argv = strip_quirk_arguments(cls, list(window["cmd"]))
+    tmux_session = window.get("tmux_session")
+    if tmux_session:
+        if is_valid_tmux_session_name(tmux_session):
+            argv.extend(["-e", "tmux", "new", "-A", "-s", tmux_session])
+            return argv
+        log(f"restore: tmux session name {tmux_session!r} failed "
+            f"validation, restoring {cls} without it")
     template = ALLOWLIST.get(window.get("program"))
     if template:
         argv.append("-e")
@@ -1252,8 +1422,15 @@ def snapshot_path() -> pathlib.Path:
 
 
 def capture(hypr, denylist: list, proc: pathlib.Path,
-            path: pathlib.Path) -> dict:
+            path: pathlib.Path, tmux_clients: dict | None = None) -> dict:
     """Read the live client list, build a snapshot, and write it.
+
+    `tmux_clients` (the pid -> session-name map from tmux_client_sessions())
+    defaults to None -- treated as {} by build_snapshot -- so every existing
+    caller that does not pass one keeps behaving exactly as before. main()
+    fetches a fresh map for every capture, the same way it re-reads
+    hypr.clients() every time: which pid is a tmux client can change
+    (attach/detach) between captures just like windows can.
 
     The write is guarded by should_write_snapshot(): at logout, Hyprland
     closes every window before the event socket dies, so watch() can observe
@@ -1285,7 +1462,7 @@ def capture(hypr, denylist: list, proc: pathlib.Path,
     calls capture() directly, with no surrounding try/except of its own.
     """
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-    snapshot = build_snapshot(hypr.clients(), denylist, proc, now)
+    snapshot = build_snapshot(hypr.clients(), denylist, proc, now, tmux_clients)
     if should_write_snapshot(snapshot, path):
         previous = read_snapshot(path)
         previous_count = None if previous is None else len(
@@ -1351,7 +1528,7 @@ def main(argv: list) -> int:
         # write (an empty snapshot over a good one), and this line used to
         # claim a write had happened either way. capture() itself logs the
         # outcome of the write.
-        snapshot = capture(hypr, denylist, proc, path)
+        snapshot = capture(hypr, denylist, proc, path, tmux_client_sessions())
         log(f"save: observed {len(snapshot['windows'])} window(s)")
         return 0
 
@@ -1381,7 +1558,8 @@ def main(argv: list) -> int:
             _restore_safely(mode, snapshot, hypr, events)
 
     log("watch: started")
-    watch(hypr, events, lambda: capture(hypr, denylist, proc, path),
+    watch(hypr, events,
+          lambda: capture(hypr, denylist, proc, path, tmux_client_sessions()),
           connect=EventSocket)
     return 0
 

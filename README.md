@@ -156,6 +156,49 @@ Two trade-offs are accepted as part of this design:
 - **`-e` means quitting the program closes the window.** The window does not
   drop back to a shell on exit, unlike a terminal opened normally.
 
+### Reattaching a tmux session
+
+A terminal attached to a named tmux session is restored by reattaching that
+exact session, taking precedence over the program allowlist above — a
+terminal running tmux is not "running claude" as far as `session.py` is
+concerned, even if claude happens to be running inside that session.
+Whatever tmux-resurrect/tmux-continuum restore *inside* the session (the
+text that was on screen, the pane layout) is their job once the tmux server
+is running again; `session.py` only gets that server started and the
+terminal window pointed at the right session, since nothing else does.
+
+Detection uses `tmux list-clients -F '#{client_pid} #{session_name}'`, the
+one authoritative source for which session a client process is attached to
+— never the client's own `/proc` cmdline, which only carries a session name
+when the user happened to type `tmux new -s <name>`; a bare `tmux` or
+`tmux attach` carries none. The pid map this produces is checked against
+the same two process-tree shapes `program` detection already understands: a
+grandchild via an interactive shell (`kitty` → `zsh` → `tmux`), or a direct
+child when kitty launches tmux itself (`kitty -e tmux ...`).
+
+```json
+{"class": "kitty", "cmd": ["kitty", "--directory", "/home/gion/coding/MS"], "tmux_session": "work"}
+```
+
+At restore time this becomes:
+
+```
+kitty --directory /home/gion/coding/MS -e tmux new -A -s work
+```
+
+`new -A -s` attaches to the session if it already exists (tmux-continuum
+restored it before this window came back) and creates it otherwise, so this
+is correct regardless of which happens first.
+
+A session name is observed data, and unlike `program` it is interpolated
+directly into that command line rather than used only as a lookup key into
+a fixed table — so it is validated before it is ever recorded, and again
+before restore builds a command from it: only letters, digits, and `_ - .`
+are accepted, and anything else (whitespace, quotes, shell metacharacters,
+control characters) is rejected and logged rather than recorded. A rejected
+name simply means that window restores as a plain terminal — the same
+fallback an unrecognised `program` already has.
+
 **Also not restored, deliberately:**
 
 - *Maximized* windows come back at their normal size. `hyprctl` reports
