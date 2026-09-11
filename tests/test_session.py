@@ -737,14 +737,9 @@ class HyprClientsTest(unittest.TestCase):
 class FakeHypr:
     def __init__(self):
         self.execs = []
-        self.rule_calls = []
 
     def exec_with_rules(self, rules, argv):
         self.execs.append((rules, argv))
-        return True
-
-    def register_title_rule(self, cls, title, workspace):
-        self.rule_calls.append((cls, title, workspace))
         return True
 
     def clients(self):
@@ -834,13 +829,44 @@ class FirstCallFailsHypr(EventEmittingHypr):
         return super().exec_with_rules(rules, argv)
 
 
-class RuleRegistrationFailsHypr(EventEmittingHypr):
-    """Launches normally, but every register_title_rule() call fails, to
-    prove a registration failure is logged and does not abort restore."""
+def live_client(cls, title, address, ws):
+    """A minimal `hyprctl -j clients` entry, as consumed by the post-restore
+    reconciliation phase: class, title, address and current workspace id."""
+    return {
+        "class": cls, "title": title, "address": address,
+        "workspace": {"id": ws, "name": str(ws)},
+    }
 
-    def register_title_rule(self, cls, title, workspace):
-        self.rule_calls.append((cls, title, workspace))
-        return False
+
+class ReconcileHypr(EventEmittingHypr):
+    """Adds move_window()/focus_workspace() tracking and a fixed clients()
+    result to EventEmittingHypr, so the post-restore reconciliation phase
+    can be tested against the same fakes the rest of RestoreTest uses.
+
+    `live_clients` is returned verbatim by every clients() call -- the
+    reconciliation phase itself tracks which addresses it has already
+    handled, so the fake does not need to mutate what it returns between
+    polls to behave correctly.
+    """
+
+    def __init__(self, events, addresses, live_clients,
+                 failing_move_addresses=()):
+        super().__init__(events, addresses)
+        self.live_clients = list(live_clients)
+        self.moves = []
+        self.focus_calls = []
+        self._failing_move_addresses = set(failing_move_addresses)
+
+    def clients(self):
+        return self.live_clients
+
+    def move_window(self, address, workspace):
+        self.moves.append((address, workspace))
+        return address not in self._failing_move_addresses
+
+    def focus_workspace(self, workspace):
+        self.focus_calls.append(workspace)
+        return True
 
 
 def window(order, cls, ws, floating=False, at=(10, 20), size=(800, 600), fs=0,
@@ -1201,7 +1227,6 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         placed = session.restore(snap, hypr, events)
         self.assertEqual(placed, 1)
         self.assertEqual(hypr.execs, [("", ["firefox"])])
-        self.assertEqual(hypr.rule_calls, [])
 
     def test_skipped_firefox_windows_are_logged_and_not_claimed_placed(self):
         events = PersistentEventBuffer()
@@ -1337,25 +1362,30 @@ class SingleInstanceRestoreTest(unittest.TestCase):
         self.assertNotIn("already restored", text)
 
 
-class SingleInstanceRuleRegistrationTest(unittest.TestCase):
-    """restore() registers a Lua window_rule (Hypr.register_title_rule) for
-    every recorded window of a single-instance class that carries a title --
-    including the one entry restore() itself is about to launch -- before
-    dispatching that class's one launch. So a window the already-running
-    app creates on its own (Firefox's session restore) still lands on its
-    recorded workspace instead of wherever is active.
+class ReconcilePlacementTest(unittest.TestCase):
+    """A single-instance class's windows carry no workspace exec rule (see
+    SingleInstanceRestoreTest), because Hyprland evaluates window rules at
+    map time and a restored Firefox window's title at that instant is still
+    the generic "Mozilla Firefox" -- the real title only arrives once the
+    page finishes loading. A rule keyed on the recorded title can therefore
+    never match, proven in production: both rules registered, neither
+    matched, and both windows landed on the active workspace.
 
-    Originally the launched entry was excluded, on the reasoning that its
-    own exec rule prefix already placed it. That reasoning was wrong: the
-    exec rule prefix attaches to whichever window the process maps FIRST,
-    which for a self-restoring single-instance app has no relationship to
-    the entry restore() launched it for (production evidence: a "New Tab"
-    window absorbed the prefix meant for a Jira tab, and the Jira window --
-    the launched entry, with no rule of its own -- landed on the active
-    workspace instead). Title matching is the only thing that identifies
-    which window is which, so every entry with a title gets a rule, the
-    launched one included, and the launch itself carries no workspace exec
-    rule at all (see SingleInstanceRestoreTest).
+    What does work, verified live: moving an already-mapped window by
+    address, via `hyprctl dispatch 'hl.dsp.window.move({ workspace = N,
+    window = "address:0x..." })'`. So restore() waits for its windows to
+    finish self-restoring (title included), then reconciles: it polls
+    hypr.clients(), matches each live single-instance-class window to a
+    recorded (title -> workspace) target, and moves whichever ones are not
+    already where they belong. The move follows focus (also verified live),
+    so the phase finishes by refocusing a fixed workspace.
+
+    A real poll would call time.sleep(interval) between attempts; that is
+    injected here as reconcile_sleep so no test actually waits on it, and
+    clock is likewise a fake monotonic counter (a tiny fixed step, so it
+    never trips restore()'s own 120s total_timeout on the way to this phase)
+    rather than time.monotonic, so a "title never appears" test can force
+    the deadline without a real 20s wait.
     """
 
     def setUp(self):
@@ -1373,126 +1403,117 @@ class SingleInstanceRuleRegistrationTest(unittest.TestCase):
     def _log(self):
         return (session.state_dir() / "session.log").read_text()
 
-    def test_rules_registered_for_every_titled_entry_including_the_launched_one(self):
-        # Three titled entries, all firefox (single-instance): three rules
-        # registered -- one per entry, including the one restore() is about
-        # to launch -- and the launch itself carries no workspace rule
-        # (asserted separately below; register_title_rule is the only thing
-        # that can place any of these windows correctly).
-        events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
-        snap = {"version": 1, "windows": [
-            window(0, "firefox", 3, title="Launched Window"),
-            window(1, "firefox", 7, title="Skipped A"),
-            window(2, "firefox", 9, title="Skipped B"),
-        ]}
-        placed = session.restore(snap, hypr, events)
-        self.assertEqual(placed, 1)
-        self.assertEqual(
-            sorted(hypr.rule_calls),
-            sorted([
-                ("firefox", "Launched Window", "3"),
-                ("firefox", "Skipped A", "7"),
-                ("firefox", "Skipped B", "9"),
-            ]),
-        )
-        # The launch itself carries no workspace exec rule: placement comes
-        # entirely from the title rules registered above.
-        self.assertEqual(hypr.execs, [("", ["firefox"])])
+    def _clock(self, step=0.001):
+        counter = itertools.count(0.0, step)
+        return lambda: next(counter)
 
-    def test_registered_rule_carries_correct_class_title_and_workspace(self):
+    def test_matching_live_windows_are_moved_to_their_recorded_workspaces(self):
         events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
-        snap = {"version": 1, "windows": [
-            window(0, "firefox", 3),
-            window(1, "firefox", 12, title="Tab Group"),
-        ]}
-        session.restore(snap, hypr, events)
-        self.assertEqual(hypr.rule_calls, [("firefox", "Tab Group", "12")])
-
-    def test_entry_with_no_recorded_title_registers_no_rule_and_does_not_crash(self):
-        events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
-        snap = {"version": 1, "windows": [
-            window(0, "firefox", 3),
-            window(1, "firefox", 7),  # no title kwarg -> no "title" key
-        ]}
-        placed = session.restore(snap, hypr, events)
-        self.assertEqual(placed, 1)
-        self.assertEqual(hypr.rule_calls, [])
-
-    def test_untitled_entry_among_titled_ones_registers_no_rule_others_still_do(self):
-        # A mix: the launched entry and the last entry carry titles, the
-        # middle one does not. The untitled one is silently skipped; the
-        # other two -- launched entry included -- still get a rule.
-        events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "A", "0xLiveA", 1),
+            live_client("firefox", "B", "0xLiveB", 1),
+        ])
         snap = {"version": 1, "windows": [
             window(0, "firefox", 3, title="A"),
-            window(1, "firefox", 7),  # no title kwarg -> no "title" key
-            window(2, "firefox", 9, title="C"),
+            window(1, "firefox", 7, title="B"),
         ]}
-        placed = session.restore(snap, hypr, events)
+        placed = session.restore(snap, hypr, events, clock=self._clock(),
+                                 reconcile_sleep=lambda s: None)
         self.assertEqual(placed, 1)
         self.assertEqual(
-            sorted(hypr.rule_calls),
-            sorted([("firefox", "A", "3"), ("firefox", "C", "9")]),
+            sorted(hypr.moves), [("0xLiveA", 3), ("0xLiveB", 7)]
         )
 
-    def test_registration_failure_is_logged_and_restore_continues(self):
+    def test_window_already_on_its_recorded_workspace_is_not_moved(self):
         events = PersistentEventBuffer()
-        hypr = RuleRegistrationFailsHypr(events, {"firefox": ["0xa"]})
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "A", "0xLiveA", 3),
+        ])
         snap = {"version": 1, "windows": [
-            window(0, "firefox", 3),
-            window(1, "firefox", 7, title="Skipped A"),
+            window(0, "firefox", 3, title="A"),
         ]}
-        placed = session.restore(snap, hypr, events)
-        # The launch itself is unaffected by the registration failure.
-        self.assertEqual(placed, 1)
-        self.assertEqual(hypr.rule_calls, [("firefox", "Skipped A", "7")])
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None)
+        self.assertEqual(hypr.moves, [])
+
+    def test_a_title_that_never_appears_is_logged_unmatched_and_does_not_block_others(self):
+        events = PersistentEventBuffer()
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "Found", "0xFound", 1),
+        ])
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 5, title="Found"),
+            window(1, "firefox", 9, title="Ghost"),
+        ]}
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None, reconcile_timeout=0)
+        # The one that did appear is still placed...
+        self.assertEqual(hypr.moves, [("0xFound", 5)])
+        # ...and the one that never showed up is named in the log, not
+        # silently dropped.
         text = self._log()
-        self.assertIn("Skipped A", text)
+        self.assertIn("Ghost", text)
+        self.assertIn("timed out", text.lower())
+
+    def test_two_live_windows_sharing_a_title_match_one_target_each(self):
+        events = PersistentEventBuffer()
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "Dup", "0xL1", 1),
+            live_client("firefox", "Dup", "0xL2", 1),
+        ])
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3, title="Dup"),
+            window(1, "firefox", 5, title="Dup"),
+        ]}
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None)
+        # Each live window claims a distinct target -- workspaces 3 and 5
+        # each appear exactly once, never both moves landing on the same one.
+        self.assertEqual(hypr.moves, [("0xL1", 3), ("0xL2", 5)])
+
+    def test_focus_is_restored_exactly_once_at_the_end(self):
+        events = PersistentEventBuffer()
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "A", "0xLiveA", 1),
+        ])
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3, title="A"),
+        ]}
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None)
+        self.assertEqual(hypr.focus_calls, [session.RECONCILE_FOCUS_WORKSPACE])
+
+    def test_no_titled_single_instance_entries_skips_the_phase_and_focus(self):
+        events = PersistentEventBuffer()
+        hypr = ReconcileHypr(events, {"kitty": ["0xa"]}, [
+            live_client("firefox", "Untracked", "0xIgnored", 1),
+        ])
+        snap = {"version": 1, "windows": [window(0, "kitty", 1)]}
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None)
+        self.assertEqual(hypr.moves, [])
+        self.assertEqual(hypr.focus_calls, [])
+
+    def test_a_move_failure_is_logged_and_the_phase_continues(self):
+        events = PersistentEventBuffer()
+        hypr = ReconcileHypr(events, {"firefox": ["0xa"]}, [
+            live_client("firefox", "A", "0xLiveA", 1),
+            live_client("firefox", "B", "0xLiveB", 1),
+        ], failing_move_addresses={"0xLiveA"})
+        snap = {"version": 1, "windows": [
+            window(0, "firefox", 3, title="A"),
+            window(1, "firefox", 7, title="B"),
+        ]}
+        session.restore(snap, hypr, events, clock=self._clock(),
+                        reconcile_sleep=lambda s: None)
+        # Both moves were attempted...
+        self.assertEqual(sorted(hypr.moves), [("0xLiveA", 3), ("0xLiveB", 7)])
+        # ...the failure was logged...
+        text = self._log()
+        self.assertIn("A", text)
         self.assertIn("failed", text.lower())
-
-    def test_non_single_instance_classes_register_no_rules(self):
-        events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"mpv": ["0xa", "0xb", "0xc"]})
-        snap = {"version": 1, "windows": [
-            window(0, "mpv", 1, title="Video A"),
-            window(1, "mpv", 2, title="Video B"),
-            window(2, "mpv", 3, title="Video C"),
-        ]}
-        placed = session.restore(snap, hypr, events)
-        self.assertEqual(placed, 3)
-        self.assertEqual(hypr.rule_calls, [])
-
-    def test_logs_running_count_of_registered_rules(self):
-        # There is no removal API for a registered window rule (see
-        # register_title_rule), so rules accumulate for the life of the
-        # Hyprland process. Nothing here dedupes or cleans that up -- the
-        # count is logged purely so the accumulation is visible.
-        events = PersistentEventBuffer()
-        hypr = EventEmittingHypr(events, {"firefox": ["0xa"]})
-        snap = {"version": 1, "windows": [
-            window(0, "firefox", 3),
-            window(1, "firefox", 7, title="Skipped A"),
-            window(2, "firefox", 9, title="Skipped B"),
-        ]}
-        session.restore(snap, hypr, events)
-        text = self._log()
-        self.assertIn("1 window rule(s) registered so far this restore", text)
-        self.assertIn("2 window rule(s) registered so far this restore", text)
-
-    def test_registration_failure_does_not_advance_the_running_count(self):
-        events = PersistentEventBuffer()
-        hypr = RuleRegistrationFailsHypr(events, {"firefox": ["0xa"]})
-        snap = {"version": 1, "windows": [
-            window(0, "firefox", 3),
-            window(1, "firefox", 7, title="Skipped A"),
-        ]}
-        session.restore(snap, hypr, events)
-        text = self._log()
-        self.assertNotIn("window rule(s) registered so far this restore", text)
+        # ...and the phase still finished, restoring focus.
+        self.assertEqual(hypr.focus_calls, [session.RECONCILE_FOCUS_WORKSPACE])
 
 
 class MalformedSnapshotRestoreTest(unittest.TestCase):
@@ -1571,19 +1592,6 @@ class RestoreLiveWindowWarningTest(unittest.TestCase):
     def test_no_warning_on_an_empty_compositor(self):
         session.restore({"version": 1, "windows": []}, FakeHypr(), SilentEvents())
         self.assertNotIn("WARNING", self._log())
-
-    def test_warning_mentions_accumulating_window_rules(self):
-        # There is no rule-removal call in Hyprland's Lua API, so rules
-        # registered by an earlier manual restore are still there on the
-        # next one. The existing warning about duplicated windows must
-        # also say so, since a manual restore is the only path where this
-        # can actually happen more than once in a session.
-        hypr = ClientListHypr([{"class": "kitty"}])
-        session.restore({"version": 1, "windows": []}, hypr, SilentEvents())
-        text = self._log()
-        self.assertIn("accumulate", text)
-        self.assertIn("persist", text)
-        self.assertIn("logout", text)
 
 
 class ExecWithRulesLuaEscapingTest(unittest.TestCase):
@@ -1677,94 +1685,65 @@ class ExecWithRulesLuaEscapingTest(unittest.TestCase):
         )
 
 
-class RegisterTitleRuleTest(unittest.TestCase):
-    """Hypr.register_title_rule() registers a Lua window_rule matched on
-    class + title, via `hyprctl eval` -- verified live: a rule registered
-    before a matching window exists still applies once the window appears,
-    including one a single-instance app (Firefox) creates on its own via
-    session restore, with no exec rule ever attached to it.
+class HyprMoveAndFocusTest(unittest.TestCase):
+    """Hypr.move_window() and Hypr.focus_workspace() dispatch through
+    `hyprctl dispatch`, not `hyprctl eval` -- verified live: `eval` merely
+    constructs the dispatcher object and discards it, while `dispatch`
+    wraps the argument in `hl.dispatch(...)`, which actually executes it.
+    Also verified live: a move follows focus (the active workspace becomes
+    the destination), which is why restore() must refocus afterwards.
     """
 
-    def _registered_lua_expr(self, cls, title, workspace):
+    def _dispatch_args(self, method, *call_args, ok=True):
         hypr = session.Hypr()
         with mock.patch.object(session.subprocess, "run") as run:
-            run.return_value = mock.Mock()
-            ok = hypr.register_title_rule(cls, title, workspace)
-        self.assertTrue(ok)
-        args = run.call_args.args[0]
-        self.assertEqual(args[0], "hyprctl")
-        self.assertEqual(args[1], "eval")
-        self.assertEqual(len(args), 3)
-        return args[2]
+            if ok:
+                run.return_value = mock.Mock()
+            else:
+                run.side_effect = session.subprocess.SubprocessError("hyprctl died")
+            result = getattr(hypr, method)(*call_args)
+        return result, run
 
-    def test_rule_carries_class_title_and_workspace(self):
-        lua_expr = self._registered_lua_expr("firefox", "My Window", "3")
+    def test_move_window_dispatches_the_verified_live_expression(self):
+        result, run = self._dispatch_args(
+            "move_window", "0x55f75cfb2200", 3
+        )
+        self.assertTrue(result)
         self.assertEqual(
-            lua_expr,
-            # re.escape() also escapes the space (it is conservative about
-            # re.VERBOSE, where unescaped whitespace is ignored) -- verified
-            # live against Hyprland 0.56.2 that the resulting "\ " in the
-            # compiled regex still matches a literal space, e.g. a rule
-            # with title "^(My\\ Test\\ Window)\$" placed a kitty window
-            # titled "My Test Window" correctly.
-            'hl.window_rule({ match = { class = "^(firefox)$", '
-            'title = "^(My\\\\ Window)$" }, workspace = "3 silent" })',
+            run.call_args.args[0],
+            ["hyprctl", "dispatch",
+             'hl.dsp.window.move({ workspace = 3, window = '
+             '"address:0x55f75cfb2200" })'],
         )
 
-    def test_title_with_regex_metacharacters_and_a_quote_is_escaped_in_both_layers(self):
-        # A title real Firefox windows produce: regex metacharacters of
-        # several kinds ( ) [ ] . ? + * plus a literal double quote, all in
-        # one string. If regex-escaping were skipped, the parens and
-        # brackets would be interpreted as grouping/character-class syntax
-        # instead of literal text, and the pattern would match far more (or
-        # less, or fail to compile) than this one title. If the double
-        # quote were not Lua-escaped, the generated Lua string literal
-        # would terminate early, corrupting the whole hyprctl eval call --
-        # exactly the class of bug _lua_quote exists to prevent elsewhere.
-        title = '(3) YouTube "Q&A" [HD].mp4?x=1+y*2'
-        lua_expr = self._registered_lua_expr("firefox", title, "10")
+    def test_move_window_failure_is_logged_and_returns_false(self):
+        result, _run = self._dispatch_args(
+            "move_window", "0xabc", 1, ok=False
+        )
+        self.assertFalse(result)
 
-        # The expected escaping is computed here independently of
-        # session.py: re.escape() is the stdlib, untouched by the
-        # implementation, and the Lua-string escaping below is written out
-        # fresh rather than calling session.Hypr._lua_quote. So a bug in
-        # either layer of the implementation, or the two layers applied in
-        # the wrong order, shows up as a mismatch instead of being quietly
-        # reproduced by reusing the same code under test.
-        regex_escaped = re.escape(title)
-        lua_escaped = regex_escaped.replace("\\", "\\\\").replace('"', '\\"')
-        self.assertIn(f'title = "^({lua_escaped})$"', lua_expr)
-        self.assertIn('class = "^(firefox)$"', lua_expr)
-        self.assertIn('workspace = "10 silent"', lua_expr)
-        # A raw, un-escaped double quote must never survive into the Lua
-        # string -- that would terminate the Lua literal early, exactly
-        # the class of bug _lua_quote exists to prevent in exec_with_rules.
-        self.assertNotIn('"Q&A"', lua_expr)
+    def test_move_window_escapes_the_address_for_lua(self):
+        # Hyprland addresses are always plain hex in practice, but the
+        # address string still passes through the same Lua-string embedding
+        # as every other value this module dispatches -- see _lua_quote.
+        result, run = self._dispatch_args(
+            "move_window", 'weird"addr', 2
+        )
+        self.assertTrue(result)
+        lua_expr = run.call_args.args[0][2]
+        self.assertIn('address:weird\\"addr', lua_expr)
 
-    def test_registration_failure_returns_false(self):
-        hypr = session.Hypr()
-        with mock.patch.object(
-            session.subprocess, "run",
-            side_effect=session.subprocess.SubprocessError("hyprctl died"),
-        ):
-            self.assertFalse(hypr.register_title_rule("firefox", "t", "3"))
+    def test_focus_workspace_dispatches_the_verified_live_expression(self):
+        result, run = self._dispatch_args("focus_workspace", 4)
+        self.assertTrue(result)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["hyprctl", "dispatch", "hl.dsp.focus({ workspace = 4 })"],
+        )
 
-    def test_class_with_regex_metacharacters_is_escaped(self):
-        # SINGLE_INSTANCE_CLASSES today only ever hands this function the
-        # literal string "firefox" (no metacharacters), so this is not
-        # exploitable yet -- but register_title_rule() itself has no way to
-        # see that gate, and a class added later that does contain
-        # metacharacters must not silently corrupt the rule. Proves `cls`
-        # gets the same re.escape()-then-Lua-quote treatment as `title`.
-        cls = "fire(fox).v2[beta]"
-        lua_expr = self._registered_lua_expr(cls, "My Window", "3")
-
-        regex_escaped = re.escape(cls)
-        lua_escaped = regex_escaped.replace("\\", "\\\\").replace('"', '\\"')
-        self.assertIn(f'class = "^({lua_escaped})$"', lua_expr)
-        # An unescaped class would let the parens/brackets act as regex
-        # grouping/character-class syntax instead of literal text.
-        self.assertNotIn('class = "^(fire(fox).v2[beta])$"', lua_expr)
+    def test_focus_workspace_failure_is_logged_and_returns_false(self):
+        result, _run = self._dispatch_args("focus_workspace", 1, ok=False)
+        self.assertFalse(result)
 
 
 class ShouldWriteSnapshotTest(unittest.TestCase):

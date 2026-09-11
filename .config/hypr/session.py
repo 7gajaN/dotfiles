@@ -181,20 +181,31 @@ ALLOWLIST = {"claude": ["claude", "--continue"]}
 # Jira window -- the launched entry, deliberately given no rule of its own
 # -- landed on the active workspace instead. Both windows wrong.
 #
-# Title matching is the only thing that can tell these windows apart, so
-# restore() registers a Lua window_rule (via Hypr.register_title_rule),
-# keyed on class + recorded title, for EVERY recorded entry of the class
-# that has a title -- including the one about to be launched, not just the
-# ones that will be skipped (see build_snapshot and the registration call
-# near the skip check below) -- and the launch itself is dispatched with an
-# empty rules string (see Hypr.exec_with_rules), placing nothing by exec
-# rule at all. A rule registered before a matching window exists still
-# applies once it appears -- verified live. An entry with no recorded title
-# gets no rule and is simply left to land wherever the compositor puts it:
-# mis-placing a window is worse than leaving it unplaced, so no fallback
-# workspace is invented for it. `hyprctl keyword` is not an option for any
-# of this -- it is unavailable on this Lua-config Hyprland -- but `hyprctl
-# eval hl.window_rule(...)` is.
+# Title matching is the only thing that can tell these windows apart, but a
+# WINDOW RULE keyed on the recorded title can never do that matching, and an
+# earlier revision of this tool that tried it is provably wrong: Hyprland
+# evaluates window rules at map time, and a restored Firefox window's title
+# at that instant is still the generic "Mozilla Firefox" -- the real title
+# (e.g. "This NBA Season Will Be Insane! - YouTube ... - Mozilla Firefox")
+# only arrives once the page finishes loading, well after the rule was
+# checked. Production evidence: both rules registered (the log showed it),
+# neither matched anything, and both windows landed on the active workspace.
+# `initialTitle` is useless as a key too -- it is identical for every
+# Firefox window.
+#
+# What does work, also verified live, is moving an already-mapped window by
+# its address: `hyprctl dispatch 'hl.dsp.window.move({ workspace = N,
+# window = "address:0x..." })'` (Hypr.move_window). `hyprctl eval` of the
+# same expression is silently inert -- eval only constructs the dispatcher
+# object and never calls it, dispatch wraps it in `hl.dispatch(...)`, which
+# does. So restore() launches this one window with no placement of its own
+# (below), then -- once its own loop is done, giving every self-restored
+# window time to finish loading and pick up its real title -- polls
+# hypr.clients() and moves each live window whose (class, title) matches a
+# recorded entry onto that entry's workspace (see the reconciliation phase
+# at the end of restore()). An entry with no recorded title is simply left
+# to land wherever the compositor puts it: mis-placing a window is worse
+# than leaving it unplaced, so no fallback workspace is invented for it.
 SINGLE_INSTANCE_CLASSES = frozenset({"firefox"})
 
 # Restore-time arguments that an earlier revision of this tool used to add,
@@ -438,10 +449,11 @@ def build_snapshot(clients: list, denylist: list, proc: pathlib.Path,
             entry["program"] = program
         if client["class"] in SINGLE_INSTANCE_CLASSES:
             # Only single-instance classes get a recorded title: restore()
-            # uses it to register a placement rule ahead of a window that
-            # the already-running app creates on its own (see
-            # SINGLE_INSTANCE_CLASSES and Hypr.register_title_rule).
-            # Recording it for every window instead would churn constantly
+            # matches it against each live window's title, after the fact,
+            # to move a window the already-running app created on its own
+            # onto its recorded workspace (see SINGLE_INSTANCE_CLASSES and
+            # _reconcile_single_instance_placements). Recording it for
+            # every window instead would churn constantly
             # -- terminal and browser titles change all the time, and the
             # periodic refresh's unchanged-write check (capture()) compares
             # the whole windows list, so a title change anywhere would
@@ -557,55 +569,55 @@ class Hypr:
         lua_expr = f'hl.dsp.exec_cmd("{self._lua_quote(payload)}")'
         return self._hyprctl(["dispatch", lua_expr])
 
-    def register_title_rule(self, cls: str, title: str, workspace: str) -> bool:
-        """Register a Lua window_rule matched on class + title via
-        `hyprctl eval hl.window_rule({...})`.
+    def move_window(self, address: str, workspace: int) -> bool:
+        """Move an already-mapped window to `workspace` by address, via
+        `hyprctl dispatch 'hl.dsp.window.move({ workspace = N, window =
+        "address:0x..." })'`.
 
-        Verified live against Hyprland 0.56.2: a rule registered BEFORE a
-        matching window is created still applies to it once it appears --
-        including a window that a single-instance app (Firefox) creates on
-        its own via its browser session restore, which never gets an exec
-        rule because this tool never launches it (see
-        SINGLE_INSTANCE_CLASSES). Registering this rule ahead of that
-        app's one launch is what makes placing those windows possible at
-        all.
+        This is the one mechanism verified live to actually place a
+        self-restored single-instance window (see SINGLE_INSTANCE_CLASSES
+        and the reconciliation phase in restore()) -- a window rule keyed on
+        title cannot, because the title Hyprland sees at map time is not the
+        title the window ends up with.
 
-        `hyprctl keyword` cannot be used instead: verified live, it fails
-        outright on this Lua-config Hyprland ("keyword can't work with
-        non-legacy parsers. Use eval."). There is also no rule-removal
-        call anywhere in the Lua API, so a rule registered here outlives
-        this process and persists until logout or `hyprctl reload` -- a
-        title that later matches nothing is simply inert from then on,
-        which is an acceptable cost for a best-effort placement hint.
+        Critical: this must go through `hyprctl dispatch`, never `hyprctl
+        eval`. Verified live, `eval 'hl.dsp.window.move({...})'` returns
+        "ok" and moves nothing -- `eval` only constructs the dispatcher
+        object hl.dsp.window.move(...) returns and never calls it. `dispatch`
+        wraps its argument in `hl.dispatch(...)`, which is what actually
+        executes it. This is unlike exec_with_rules(), which wraps its
+        payload in `hl.dsp.exec_cmd(...)` itself before handing it to
+        `dispatch` -- here the move expression is passed to `dispatch`
+        directly, with no extra wrapper, exactly as verified live.
 
-        Both class and title are embedded twice over, and the order
-        matters for each: first as a regex, wrapped in `^(...)$` so it
-        matches only itself and not a substring of some other window's
-        class or title -- real Firefox titles routinely contain regex
-        metacharacters like `(`, `)`, `[`, `]` and `.`, so this uses
-        re.escape() rather than trusting the text raw. `cls` gets the same
-        treatment even though the only production call path gates on
-        membership in SINGLE_INSTANCE_CLASSES (today just the literal
-        string "firefox", which has no metacharacters to begin with): that
-        gate is a convention enforced elsewhere, not something this
-        function can see, and a future class name containing a
-        metacharacter must not silently corrupt the rule. Only after the
-        regex escaping is the whole pattern embedded as a Lua
-        double-quoted string literal via _lua_quote(), exactly as
-        exec_with_rules() does for the command it launches. Escaping for
-        Lua first and regex second would double-escape the backslashes
-        re.escape() itself introduces, corrupting the pattern; regex
-        first, then Lua, is the only order that produces a working rule.
+        The address is embedded via _lua_quote() like every other value this
+        module ever puts inside a Lua string literal, even though a real
+        Hyprland address is always plain hex -- the same discipline
+        exec_with_rules() applies to argv.
+
+        Failure is logged (inside Hypr, via _hyprctl) and returns False; it
+        must never raise, since the reconciliation phase that calls this
+        must never abort a restore over one bad move.
         """
-        class_pattern = f"^({re.escape(cls)})$"
-        title_pattern = f"^({re.escape(title)})$"
         lua_expr = (
-            'hl.window_rule({ match = { class = "'
-            f'{self._lua_quote(class_pattern)}", title = '
-            f'"{self._lua_quote(title_pattern)}" }}, workspace = '
-            f'"{self._lua_quote(f"{workspace} silent")}" }})'
+            "hl.dsp.window.move({ workspace = "
+            f'{int(workspace)}, window = "address:{self._lua_quote(address)}" }})'
         )
-        return self._hyprctl(["eval", lua_expr])
+        return self._hyprctl(["dispatch", lua_expr])
+
+    def focus_workspace(self, workspace: int) -> bool:
+        """Focus `workspace`, via `hyprctl dispatch 'hl.dsp.focus({
+        workspace = N })'`.
+
+        Verified live that a window move (see move_window()) follows focus:
+        the active workspace becomes the destination of the move, even when
+        `silent = true` is passed to the move. So the reconciliation phase
+        that calls move_window() repeatedly must call this once at the end
+        to put focus back where the user's session actually is -- see
+        RECONCILE_FOCUS_WORKSPACE and restore().
+        """
+        lua_expr = f"hl.dsp.focus({{ workspace = {int(workspace)} }})"
+        return self._hyprctl(["dispatch", lua_expr])
 
 
 class EventSocket:
@@ -694,75 +706,142 @@ def _await_window(events, cls: str, deadline: float, clock, consumed: set | None
     return None
 
 
-def _register_rules_for_class(hypr, windows: list, cls: str,
-                               rules_registered: int) -> int:
-    """Register a placement rule for every recorded window of `cls` that
-    has a title -- including the one entry restore() is about to launch.
+# The post-restore reconciliation phase's default poll interval and
+# deadline: how often it re-checks `hypr.clients()` for a single-instance
+# window that has not yet appeared or moved, and how long it waits in total
+# before giving up and logging whichever titles never showed. Parameters on
+# restore() so tests can override both without a real sleep.
+RECONCILE_POLL_INTERVAL = 0.5
+RECONCILE_DEADLINE = 20.0
 
-    Called by restore() right before it dispatches the one launch of a
-    single-instance class. Every recorded entry of that class besides the
-    one being launched is one restore() itself will never launch
-    (SINGLE_INSTANCE_CLASSES), since the already-running process creates it
-    via its own session restore instead -- with no exec rule attached.
-    Registering a rule for it now, before that launch, is what lets it
-    land on its recorded workspace anyway (verified live: a rule
-    registered ahead of time still applies to a window created later).
+# Moving a window by address follows focus -- verified live, the active
+# workspace becomes the destination of the move even with `silent = true`
+# passed to it. The reconciliation phase therefore ends by refocusing this
+# workspace, since its moves would otherwise leave focus wherever the last
+# move happened to drag it.
+RECONCILE_FOCUS_WORKSPACE = 1
 
-    The entry being launched gets a rule too, on the same terms, and the
-    launch itself carries no workspace exec rule (see Hypr.exec_with_rules
-    and restore()). An earlier revision excluded the launched entry here,
-    reasoning that its own exec rule prefix already placed it -- but that
-    prefix is applied to whichever window the process maps FIRST, which
-    for a self-restoring single-instance app has no relationship to the
-    entry restore() launched it for (production evidence: a "New Tab"
-    window absorbed a prefix meant for a Jira tab, and the Jira window --
-    the launched entry, given no rule of its own -- landed on the active
-    workspace instead). Title matching is the only thing that can tell
-    these windows apart, so every titled entry gets a rule, launched one
-    included.
 
-    An entry with no recorded title is silently left without a rule -- an
-    older snapshot, or a window whose title hyprctl reported empty, simply
-    keeps today's behaviour of landing wherever is active. A registration
-    failure is logged (inside Hypr, via _hyprctl) but never raised, so one
-    bad rule never aborts the rest of restore().
+def _reconcile_single_instance_placements(
+        hypr, windows: list, clock,
+        interval: float = RECONCILE_POLL_INTERVAL,
+        deadline_seconds: float = RECONCILE_DEADLINE,
+        sleep=time.sleep,
+        focus_workspace: int = RECONCILE_FOCUS_WORKSPACE) -> None:
+    """Move each self-restored single-instance window onto its recorded
+    workspace by address, once it has actually mapped and picked up its
+    real title -- see SINGLE_INSTANCE_CLASSES for why a window rule keyed on
+    title can never do this instead.
 
-    `rules_registered` is the running count of rules successfully
-    registered so far this restore, passed in by the caller and returned
-    updated so it can be threaded through further calls (there is at most
-    one today, since only one class is single-instance, but nothing here
-    assumes that). There is no rule-removal call anywhere in Hyprland's
-    Lua API (see register_title_rule), so every rule registered here
-    outlives this process and stays active until logout or `hyprctl
-    reload` -- including one left behind by an earlier, unrelated restore.
-    This count is logged purely to make that accumulation visible, not to
-    dedupe or clean it up: a dedupe cache here would only cover rules
-    registered by this process, giving false assurance about the ones a
-    previous process left behind.
+    Called by restore() after its main loop, so every single-instance
+    window -- both the one restore() itself launched with no placement of
+    its own, and every other one the already-running app recreated by
+    itself -- has had a chance to map before this starts matching on title.
+
+    Builds its target list from every recorded entry (in `windows`) whose
+    class is single-instance and carries a title: (class, title) ->
+    workspace. Two entries can carry the same title -- e.g. two windows a
+    browser happened to title identically -- so this is a list of
+    (class, title) -> workspace pairs, not a dict keyed on title alone: a
+    dict would collapse duplicates and under-match. It then polls
+    hypr.clients() until every target has been matched to a distinct live
+    window or `deadline_seconds` (measured via `clock`) elapses, sleeping
+    `interval` between polls via the injected `sleep` (real code passes
+    time.sleep; tests inject a no-op alongside a fake `clock` so nothing
+    here ever waits for real).
+
+    A live window is matched to a target the moment its (class, title) first
+    equals an unconsumed target -- consuming it immediately, before the move
+    is even attempted, so the same live window is never matched twice and
+    the same target is never handed to two different windows. If the window
+    is already on its target workspace, move_window() is not called at all;
+    otherwise the move is attempted and its outcome logged either way. A
+    move_window() failure is logged and does not stop the phase -- the
+    remaining targets still get their turn, and every failure is
+    independent of every other.
+
+    Whatever is still unmatched once the deadline passes is logged by title,
+    so a drifted or never-appearing window is visible in session.log instead
+    of just silently missing. Either way -- fully matched or timed out --
+    the phase always ends by calling focus_workspace(), exactly once, since
+    every move it made along the way drags the active workspace with it.
+
+    Must never raise: restore() wraps the call anyway (belt and braces,
+    matching _restore_safely's relationship to restore() itself), but every
+    failure this function can anticipate -- a bad move, a target that never
+    shows up -- is handled internally rather than left to that wrapper.
     """
-    for other in windows:
-        if not isinstance(other, dict) or other.get("class") != cls:
+    targets = []
+    for entry in windows:
+        if not isinstance(entry, dict):
             continue
-        title = other.get("title")
+        cls = entry.get("class")
+        if cls not in SINGLE_INSTANCE_CLASSES:
+            continue
+        title = entry.get("title")
         if not title:
             continue
-        workspace = other.get("workspace")
-        log(f"restore: registering window rule for {cls} title={title!r} "
-            f"-> workspace {workspace} (a window {cls} will restore itself, "
-            "not launched by this tool)")
-        if hypr.register_title_rule(cls, title, str(workspace)):
-            rules_registered += 1
-            log(f"restore: {rules_registered} window rule(s) registered so "
-                "far this restore -- registered rules have no removal API "
-                "and stay active until logout or hyprctl reload")
-        else:
-            log(f"restore: failed to register window rule for {cls} "
-                f"title={title!r} -> workspace {workspace}")
-    return rules_registered
+        targets.append([cls, title, entry.get("workspace")])
+
+    if not targets:
+        # Nothing to reconcile -- and nothing moved focus, so it is left
+        # exactly where it already was.
+        return
+
+    remaining = len(targets)
+    handled_addresses = set()
+    deadline = clock() + deadline_seconds
+
+    while True:
+        for client in hypr.clients():
+            if remaining <= 0:
+                break
+            if not isinstance(client, dict):
+                continue
+            address = client.get("address")
+            if address is None or address in handled_addresses:
+                continue
+            cls = client.get("class")
+            if cls not in SINGLE_INSTANCE_CLASSES:
+                continue
+            title = client.get("title")
+            target = next(
+                (t for t in targets if t[0] == cls and t[1] == title), None
+            )
+            if target is None:
+                continue
+            targets.remove(target)
+            handled_addresses.add(address)
+            remaining -= 1
+            _, _, workspace = target
+            current_workspace = (client.get("workspace") or {}).get("id")
+            if current_workspace == workspace:
+                continue
+            if hypr.move_window(address, workspace):
+                log(f"restore: reconcile moved {cls} {title!r} to "
+                    f"workspace {workspace} (address {address})")
+            else:
+                log(f"restore: reconcile failed to move {cls} {title!r} "
+                    f"to workspace {workspace} (address {address})")
+
+        if remaining <= 0:
+            break
+        if clock() >= deadline:
+            for cls, title, workspace in targets:
+                log(f"restore: reconcile timed out waiting for {cls} "
+                    f"window titled {title!r} (expected workspace "
+                    f"{workspace})")
+            break
+        sleep(interval)
+
+    hypr.focus_workspace(focus_workspace)
 
 
 def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
-            total_timeout: float = 120.0, clock=time.monotonic) -> int:
+            total_timeout: float = 120.0, clock=time.monotonic,
+            reconcile_interval: float = RECONCILE_POLL_INTERVAL,
+            reconcile_timeout: float = RECONCILE_DEADLINE,
+            reconcile_sleep=time.sleep) -> int:
     """Relaunch each saved window onto its workspace, one at a time.
 
     Serial by design: with several windows of the same class, parallel launches
@@ -785,17 +864,15 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     its own already-running process instead of opening a new window, so only
     the first recorded window of such a class is launched here at all -- see
     the skip check at the top of the loop below. Every other recorded window
-    of that class is skipped, not launched, and not counted as placed.
-    Just before that one launch is dispatched, a Lua window_rule is
-    registered for every recorded entry of the class that carries a title --
-    including the one about to be launched, not only the skipped ones (see
-    _register_rules_for_class and SINGLE_INSTANCE_CLASSES) -- so each window
-    the app creates, itself included, lands on its recorded workspace by
-    title match. The launch itself is dispatched with no workspace exec
-    rule at all: that prefix would attach to whichever window the process
-    maps first, which bears no relationship to the entry it was launched
-    for. Placement by title is unconfirmed here, hence never counted as
-    placed.
+    of that class is skipped, not launched, and not counted as placed. The
+    one launch that does happen carries no workspace exec rule at all: that
+    prefix would attach to whichever window the process maps first, which
+    bears no relationship to the entry it was launched for. Placement for
+    every window of this class -- launched one included -- is unconfirmed
+    here, hence never counted as placed; it is handled entirely by the
+    post-restore reconciliation phase below, which moves each one by
+    address once it has actually mapped and picked up its real title (see
+    SINGLE_INSTANCE_CLASSES and _reconcile_single_instance_placements).
     """
     if not isinstance(snapshot, dict):
         log(f"restore: snapshot is not an object ({type(snapshot).__name__}), "
@@ -810,13 +887,10 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     live = hypr.clients()
     if live:
         log(f"restore: WARNING {len(live)} window(s) are already open. restore "
-            "does not reconcile against live windows -- every saved window is "
-            "launched again, so these will be duplicated. restore is meant for "
-            "the boot path, where the compositor is empty. Repeated manual "
-            "restores also accumulate window rules (registered for "
-            "single-instance classes' other windows) that persist until "
-            "logout -- there is no removal API, so they are not cleaned up "
-            "between runs.")
+            "does not reconcile against live windows before launching -- "
+            "every saved window is launched again, so these will be "
+            "duplicated. restore is meant for the boot path, where the "
+            "compositor is empty.")
 
     windows = sorted(
         entries,
@@ -826,7 +900,6 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
     started = clock()
     seen: dict = {}
     placed = 0
-    rules_registered = 0
     # Belt and braces alongside the unconditional exhaustive drain below: the
     # drain is what actually keeps stale events out of a launch's way, and no
     # scenario is known in which this set is the only thing preventing a
@@ -872,20 +945,16 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
 
             # This is the one window of a single-instance class that is
             # about to be launched (the check above already sent every
-            # later one of the same class to "continue"). Before
-            # dispatching it, register a placement rule for every recorded
-            # window of this class that carries a title -- including this
-            # very entry, not just the others this restore will never
-            # launch itself. A rule registered now still applies once a
-            # matching window appears (verified live), and title matching
-            # is the only thing that can tell these windows apart: the
-            # exec rule prefix below is not given a workspace, since it
-            # would attach to whichever window this process happens to map
-            # first, with no relationship to this entry (see
-            # SINGLE_INSTANCE_CLASSES).
-            if cls in SINGLE_INSTANCE_CLASSES:
-                rules_registered = _register_rules_for_class(
-                    hypr, windows, cls, rules_registered)
+            # later one of the same class to "continue"). It gets no
+            # placement here at all -- not a workspace exec rule (below)
+            # and not anything else -- because at launch time this window
+            # does not exist yet to be placed, and every other window of
+            # this class only exists once the already-running app restores
+            # itself, later still. Every window of this class, this one
+            # included, is placed after the fact by the post-restore
+            # reconciliation phase (see SINGLE_INSTANCE_CLASSES and
+            # _reconcile_single_instance_placements, called at the end of
+            # this function).
 
             # Drain any events already pending, unconditionally, right before
             # this window's launch. An event sitting in the buffer at this
@@ -902,12 +971,13 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
 
             argv = restore_command(window, seen)
             if cls in SINGLE_INSTANCE_CLASSES:
-                # No exec rule at all -- see SINGLE_INSTANCE_CLASSES and
-                # the registration call above. Any rule here, workspace or
-                # otherwise, would apply to whichever window this process
-                # happens to map first, not necessarily this entry; the
-                # title rules registered above are the only correct way to
-                # place any window of this launch.
+                # No exec rule at all -- see SINGLE_INSTANCE_CLASSES. Any
+                # rule here, workspace or otherwise, would apply to
+                # whichever window this process happens to map first, not
+                # necessarily this entry; placement for this window (and
+                # every other window of this class) happens after the fact,
+                # by address, in the reconciliation phase at the end of
+                # restore().
                 rules = ""
             else:
                 rule_parts = [f"workspace {window['workspace']} silent"]
@@ -969,6 +1039,24 @@ def restore(snapshot: dict, hypr, events, per_window_timeout: float = 10.0,
             continue
 
     log(f"restore: placed {placed}/{len(windows)} window(s)")
+
+    # Post-restore reconciliation: place every single-instance window (the
+    # one this function itself launched with no placement of its own, and
+    # every other one the already-running app recreated by itself) by
+    # address, now that each has had the chance to map and pick up its real
+    # title. Wrapped so a failure here -- anticipated or not -- degrades to
+    # a log line rather than an exception escaping restore(), matching the
+    # rest of this function's contract.
+    try:
+        _reconcile_single_instance_placements(
+            hypr, windows, clock,
+            interval=reconcile_interval,
+            deadline_seconds=reconcile_timeout,
+            sleep=reconcile_sleep,
+        )
+    except Exception as exc:
+        log(f"restore: reconcile phase failed, continuing: {exc!r}")
+
     return placed
 
 

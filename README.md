@@ -202,43 +202,52 @@ the exec rule meant for the Jira tab landed on the New Tab window instead,
 and the Jira tab — with no rule of its own — landed on whatever workspace
 happened to be active. Both windows wrong.
 
-Placement for these apps therefore comes entirely from title matching, not
-from the launch itself: before that one launch, `session.py` registers a
-Hyprland window rule (via `hyprctl eval hl.window_rule(...)`) matched on
-class and recorded title for every recorded window of that class that has
-a title — including the one about to be launched, not only the others —
-and a rule registered ahead of time still applies to a window the app goes
-on to create by itself. `session.py` logs each recorded window it skips
-launching this way, and separately logs each window rule it registers
-(and any that fails to register), so both the skip and the placement
-attempt are explained rather than silent. Terminals and other applications
-that spawn one process per window are placed normally, workspace exec rule
+A window *rule* keyed on the recorded title cannot fix this either — an
+earlier revision of this tool tried exactly that, and it is provably wrong.
+Hyprland evaluates window rules at map time, and a restored Firefox
+window's title at that instant is still the generic `Mozilla Firefox`; the
+real title only arrives once the page finishes loading. Confirmed live:
+both rules registered (the log showed it), neither matched anything, and
+both windows landed on the active workspace regardless.
+
+Placement for these apps instead happens after the fact, once every window
+has had a chance to map and pick up its real title: `session.py` polls
+`hyprctl -j clients`, and for each live window of a single-instance class
+it finds a class-and-title match against the recorded snapshot and moves
+it onto that entry's workspace by address —
+`hyprctl dispatch 'hl.dsp.window.move({ workspace = N, window =
+"address:0x..." })'`. This has to go through `hyprctl dispatch`, not
+`hyprctl eval`: `eval` on the same expression returns `ok` and moves
+nothing, since it only constructs the dispatcher object and never calls
+it — `dispatch` wraps the argument in `hl.dispatch(...)`, which actually
+executes it. A window already on its recorded workspace is left alone. A
+move also drags the active workspace along with it — confirmed live, even
+with `silent = true` passed to the move — so once every window has been
+placed (or the poll times out) `session.py` refocuses a fixed workspace
+(`RECONCILE_FOCUS_WORKSPACE`, default `1`) to put focus back where the
+session actually is. `session.py` logs each move, each failed move, and
+each recorded title that never showed up by the deadline, so the outcome
+is explained rather than silent. Terminals and other applications that
+spawn one process per window are placed normally, workspace exec rule
 included; add a class to `SINGLE_INSTANCE_CLASSES` in `session.py` if
 another single-instance application is encountered — `firefox` is already
 there.
 
 Placement of these windows is best-effort, not guaranteed: it depends on
-the window's title at restore time matching what was recorded at save
-time. A title that changes in between — a notification counter like
-`(3)`, or a page that rewrites its own title after loading — will not
-match the registered rule, and that window lands unplaced, wherever the
+the window's title, once loaded, matching what was recorded at save time.
+A title that changes in between — a notification counter like `(3)`, or a
+page that rewrites its own title after loading — will not match, and that
+window is logged as unmatched at the poll deadline and lands wherever the
 compositor's default happens to put it, rather than being mis-placed onto
 some other window's workspace: `session.py` never invents a fallback
 workspace for a single-instance launch, since a wrong placement is worse
 than none.
 
-Registered rules also have no removal call anywhere in Hyprland's Lua API,
-so each one stays active until logout or `hyprctl reload`, no matter which
-process registered it. Running `restore` by hand more than once in a
-session (see the warning above about duplicated windows) also layers
-another generation of these rules on top with no dedupe, and `session.log`
-logs a running count so the accumulation is visible.
-
-Existing snapshots written before this title-recording behaviour was added
-carry no titles at all, so the first reboot after deploying it launches
-Firefox once, unplaced, and places none of its windows at all — there is
-nothing to register a rule from yet. The capture that follows records
-titles for the first time, and the next reboot places them normally.
+Existing snapshots written before titles were recorded at all carry none,
+so the first reboot after deploying this launches Firefox once, unplaced,
+and reconciles nothing — there is no title to match against yet. The
+capture that follows records titles for the first time, and the next
+reboot places them normally.
 
 Tests: `python -m unittest discover -s tests`
 
