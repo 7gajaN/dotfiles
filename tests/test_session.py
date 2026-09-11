@@ -1569,6 +1569,48 @@ class WatchTest(unittest.TestCase):
                       stop=stop)
         self.assertEqual(len(writes), 1)
 
+    def test_interval_elapsing_before_debounce_still_captures_exactly_once(self):
+        """The branch this review specifically flagged: an event is
+        pending and its own debounce has not elapsed, but the periodic
+        interval has. That must still capture -- exactly once, with
+        pending_since cleared so the event's now-moot debounce deadline,
+        once it too passes, does not trigger a second, redundant capture.
+        """
+        writes = []
+        checkpoint = {}
+        events = ScriptedEvents([
+            [],                          # iter1: nothing yet, bootstrap
+            [("movewindow", "0xa,2")],   # iter2: event arrives (t=5)
+            [],                          # iter3: interval (6s since t=0)
+                                          #        elapses before the 4s
+                                          #        debounce (since t=5) does
+                                          #        -> capture via the elif.
+            [],                          # iter4: the event's own debounce
+                                          #        deadline (t=9) has now
+                                          #        passed too, but must not
+                                          #        fire a second capture.
+        ])
+        ticks = iter([0.0, 5.0, 5.0, 7.0, 10.0])
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            if calls["n"] == 4:
+                # iter3 has just run; iter4 has not started yet.
+                checkpoint["after_iter3"] = len(writes)
+            return calls["n"] > 4
+
+        session.watch(FakeHypr(), events, lambda: writes.append(1),
+                      debounce=4.0, interval=6.0, clock=lambda: next(ticks),
+                      stop=stop)
+
+        # The interval fired the capture on its own, ahead of the event's
+        # own debounce -- not merely eventually, once the debounce (later)
+        # elapsed too.
+        self.assertEqual(checkpoint["after_iter3"], 1)
+        # And nothing captured a second time once that stale deadline passed.
+        self.assertEqual(len(writes), 1)
+
 
 class WatchReconnectTest(unittest.TestCase):
     """The spec's error handling: "`watch` loses the socket: reconnect with
@@ -1867,16 +1909,35 @@ class CaptureTest(unittest.TestCase):
     # is against the windows list only.
 
     def test_repeated_capture_with_no_change_does_not_rewrite(self):
+        # Both capture() calls below execute within the same wall-clock
+        # second, so datetime.now() alone would make saved_at identical
+        # regardless of whether the comparison actually excludes it -- this
+        # test would then pass by accident, whether or not the exclusion is
+        # real. Force a genuinely advancing clock so the windows-only
+        # comparison is what's actually being exercised, not a same-second
+        # coincidence.
         fake_proc(self.proc, 1, ["kitty"], "kitty", "/home/u")
         hypr = ClientListHypr([self.client("kitty", 1, 1)])
-        session.capture(hypr, [], self.proc, self.path)
-        on_disk_first = session.read_snapshot(self.path)
 
-        session.capture(hypr, [], self.proc, self.path)
-        on_disk_second = session.read_snapshot(self.path)
+        counter = itertools.count()
+        base = session.datetime.datetime(2026, 1, 1, 0, 0, 0)
 
-        # saved_at would differ on every build; an unchanged file on disk
-        # (saved_at included) proves the second call skipped the write.
+        class _AdvancingDateTime(session.datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return base + session.datetime.timedelta(seconds=next(counter))
+
+        with mock.patch.object(session.datetime, "datetime", _AdvancingDateTime):
+            first_snapshot = session.capture(hypr, [], self.proc, self.path)
+            on_disk_first = session.read_snapshot(self.path)
+
+            second_snapshot = session.capture(hypr, [], self.proc, self.path)
+            on_disk_second = session.read_snapshot(self.path)
+
+        # The two builds really do carry different saved_at values --
+        # confirming the test below isn't vacuously true.
+        self.assertNotEqual(first_snapshot["saved_at"], second_snapshot["saved_at"])
+        # ...yet the file on disk was not rewritten with the second one.
         self.assertEqual(on_disk_second, on_disk_first)
         self.assertIn("capture: skipped write, snapshot is unchanged", self._log())
 
