@@ -114,3 +114,9 @@ source $ZSH/oh-my-zsh.sh
 export PATH=$PATH:/home/gion/.spicetify
 fastfetch
 export PATH="$HOME/.local/bin:$PATH"
+
+# Disable legacy XON/XOFF flow control. Ctrl-s otherwise freezes the terminal
+# (and Ctrl-q unfreezes it), which is never what you want on a modern system
+# and makes Ctrl-s unusable as a keybinding -- including tmux-resurrect's
+# save binding, prefix + Ctrl-s.
+stty -ixon

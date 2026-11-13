@@ -36,3 +36,4 @@ alias grep='grep --color=auto'
 PS1='[\u@\h \W]\$ '
 
 [ -n "$DISPLAY" ] && xrdb -merge ~/.Xresources
+stty -ixon
