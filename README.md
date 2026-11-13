@@ -199,6 +199,22 @@ control characters) is rejected and logged rather than recorded. A rejected
 name simply means that window restores as a plain terminal — the same
 fallback an unrecognised `program` already has.
 
+**Installing the tmux plugins.** `.config/tmux/tmux.conf` loads
+tmux-resurrect and tmux-continuum from `~/.local/share/tmux/plugins`. They
+are third-party code, so they are not in this repo and no plugin manager
+fetches them. On a new machine, clone them before starting tmux:
+
+```sh
+mkdir -p ~/.local/share/tmux/plugins
+git clone https://github.com/tmux-plugins/tmux-resurrect.git ~/.local/share/tmux/plugins/tmux-resurrect
+git clone https://github.com/tmux-plugins/tmux-continuum.git ~/.local/share/tmux/plugins/tmux-continuum
+```
+
+Without them, the `run-shell` lines in `tmux.conf` print an error when tmux
+starts. Sessions still work, but their contents do not survive a reboot.
+Save by hand with prefix + S, restore with prefix + R (prefix is
+Ctrl-Space).
+
 **Also not restored, deliberately:**
 
 - *Maximized* windows come back at their normal size. `hyprctl` reports
